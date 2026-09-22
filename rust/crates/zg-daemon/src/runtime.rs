@@ -6,9 +6,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header::HOST, uri::Authority},
     routing::{get, post},
 };
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
-};
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -99,7 +97,7 @@ pub(crate) async fn run_server(
         .with_max_request_body_bytes(1024 * 1024);
     let mcp_service = StreamableHttpService::new(
         move || Ok(mcp_server.clone()),
-        LocalSessionManager::default().into(),
+        Arc::new(crate::mcp_sessions::BoundedSessionManager::default()),
         mcp_config,
     );
     let app = Router::new()

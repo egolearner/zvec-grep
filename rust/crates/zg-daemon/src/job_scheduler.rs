@@ -594,6 +594,14 @@ fn merge_options(current: &mut Option<IndexOptions>, mut incoming: IndexOptions)
     current.reset_paths |= incoming.reset_paths;
     current.rebuild |= incoming.rebuild;
     merge_update(&mut current.scan.globs, incoming.scan.globs.take());
+    merge_update(
+        &mut current.scan.file_types,
+        incoming.scan.file_types.take(),
+    );
+    merge_update(
+        &mut current.scan.excluded_file_types,
+        incoming.scan.excluded_file_types.take(),
+    );
     merge_update(&mut current.scan.hidden, incoming.scan.hidden.take());
     merge_update(&mut current.scan.no_ignore, incoming.scan.no_ignore.take());
     merge_update(

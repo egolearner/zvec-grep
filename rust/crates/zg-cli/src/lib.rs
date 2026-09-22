@@ -317,6 +317,7 @@ impl ScanArgs {
             max_depth: self.max_depth.map(Some),
             max_file_size_bytes: self.max_file_size_bytes.map(Some),
             follow_symlinks: self.follow_symlinks,
+            ..ScanRulesUpdate::default()
         }
     }
 

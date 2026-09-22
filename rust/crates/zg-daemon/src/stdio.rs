@@ -100,8 +100,15 @@ where
             _ = monitor.tick() => {
                 let current = match server_status(home).await {
                     Ok(current) => current,
+                    Err(error) if connected.pid.is_some_and(crate::controller::process_is_alive) => {
+                        warn!(%error, "daemon status temporarily unavailable; keeping MCP relay connected");
+                        continue;
+                    }
                     Err(error) => break Err(error),
                 };
+                if current.pid.is_none() && connected.pid.is_some_and(crate::controller::process_is_alive) {
+                    continue;
+                }
                 if !same_daemon(connected, &current) {
                     break Err(DaemonError::McpBridge(
                         "daemon stopped or changed while stdio was connected".to_owned(),

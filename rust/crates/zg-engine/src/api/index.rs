@@ -77,6 +77,10 @@ pub mod options {
     #[serde(default, deny_unknown_fields)]
     pub struct ScanRulesUpdate {
         #[serde(skip_serializing_if = "Option::is_none")]
+        pub file_types: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub excluded_file_types: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         pub globs: Option<Vec<GlobRule>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub hidden: Option<bool>,
@@ -104,6 +108,12 @@ pub mod options {
     impl ScanRulesUpdate {
         /// Applies only the fields supplied by this request.
         pub fn apply(&self, target: &mut ScanRules) {
+            if let Some(value) = &self.file_types {
+                target.file_types.clone_from(value);
+            }
+            if let Some(value) = &self.excluded_file_types {
+                target.excluded_file_types.clone_from(value);
+            }
             if let Some(value) = &self.globs {
                 target.globs.clone_from(value);
             }
@@ -419,6 +429,9 @@ pub mod result {
         pub duration_micros: u64,
         pub timings: Vec<TimingEntry>,
         pub skipped: Vec<SkippedFile>,
+        /// Full skip counts, independent of the bounded diagnostic samples.
+        #[serde(default)]
+        pub skipped_counts: std::collections::BTreeMap<String, usize>,
     }
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

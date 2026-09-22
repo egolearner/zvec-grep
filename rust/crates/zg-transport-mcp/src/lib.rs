@@ -5,12 +5,13 @@
 
 mod consent;
 mod request;
+mod rg_format;
 mod search_format;
 
 pub use search_format::SearchPreview;
 
 use std::{
-    fmt::{self, Write as _},
+    fmt,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -39,7 +40,7 @@ use zg_engine::{
                 ContextRoute, ContextRouteMode, FileCategory, FileFormat, QueryFilter,
                 RefreshPolicy, SymbolType,
             },
-            result::{ContentRange, ContextItem, ContextItemStatus, MatchedBy},
+            result::{ContentRange, MatchedBy},
         },
         index::{
             IndexOptions,
@@ -256,6 +257,7 @@ pub struct ZvecGrepMcpServer {
     status: Option<Arc<dyn ServerStatusProvider>>,
     toolset: McpToolset,
     router: ToolRouter<Self>,
+    consent_state: Arc<consent::ContinuationState>,
 }
 
 impl ZvecGrepMcpServer {
@@ -332,6 +334,7 @@ impl ZvecGrepMcpServer {
             status,
             toolset,
             router,
+            consent_state: Arc::new(consent::ContinuationState::default()),
         }
     }
 
@@ -474,15 +477,23 @@ impl ZvecGrepMcpServer {
     async fn zvec_grep_rg(
         &self,
         Parameters(input): Parameters<RgInput>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let request = input
+        let mut request = input
             .into_request()
             .map_err(|message| ErrorData::invalid_params(message, None))?;
-        Ok(match self.engine.context(request).await {
-            Ok(reply) => context_result_to_tool_result(&reply),
-            Err(error) => error_result(&error),
-        })
+        Ok(
+            match request::run(&context, |progress, signal| {
+                request.on_progress = progress;
+                request.signal = Some(signal);
+                self.engine.context(request)
+            })
+            .await
+            {
+                Ok(reply) => context_result_to_tool_result(&reply),
+                Err(error) => error_result(&error),
+            },
+        )
     }
 
     #[tool(
@@ -563,11 +574,66 @@ impl ServerHandler for ZvecGrepMcpServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        if let Some(arguments) = &request.arguments {
+            for (field, value) in arguments {
+                if value.is_null()
+                    && !(request.name == "zvec_grep_index"
+                        && matches!(field.as_str(), "maxDepth" | "maxFileSizeBytes"))
+                {
+                    return Err(ErrorData::invalid_params(
+                        format!("{field} cannot be null; omit the field to use its default"),
+                        None,
+                    ));
+                }
+                if request.name == "zvec_grep_search"
+                    && matches!(
+                        field.as_str(),
+                        "hidden"
+                            | "noIgnore"
+                            | "ignoreFiles"
+                            | "maxDepth"
+                            | "maxFileSizeBytes"
+                            | "follow"
+                    )
+                {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "{field} configures scanning; use zvec_grep_index to change the indexed scope"
+                        ),
+                        None,
+                    ));
+                }
+            }
+        }
+        if self
+            .router
+            .list_all()
+            .iter()
+            .any(|tool| tool.name == request.name)
+        {
+            match self.consent_state.prepare(&request, &mut context) {
+                Ok(Some(result)) => return Ok(result),
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+        }
         self.router
             .call(ToolCallContext::new(self, request, context))
             .await
+    }
+
+    fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<rmcp::model::DiscoverResult, ErrorData>> + Send {
+        std::future::ready(Ok(rmcp::model::DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info(),
+        )
+        .with_ttl_ms(3_600_000)
+        .with_cache_scope(rmcp::model::CacheScope::Private)))
     }
 
     fn list_tools(
@@ -577,6 +643,8 @@ impl ServerHandler for ZvecGrepMcpServer {
     ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send {
         std::future::ready(Ok(ListToolsResult {
             tools: self.router.list_all(),
+            ttl_ms: Some(3_600_000),
+            cache_scope: Some(rmcp::model::CacheScope::Private),
             ..ListToolsResult::default()
         }))
     }
@@ -609,17 +677,21 @@ impl From<GlobRule> for GlobInput {
     }
 }
 
+/// Public string/list globs plus the existing typed-rule extension.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum GlobListInput {
+    One(String),
+    Strings(Vec<String>),
+    Rules(Vec<GlobInput>),
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SearchInput {
     /// Absolute workspace root visible to the daemon.
     #[schemars(length(min = 1, max = 1024))]
     pub root: String,
-    /// One-request embedding provider API key override.
-    #[schemars(length(min = 1, max = 8192))]
-    pub api_key: Option<String>,
-    /// One-request local embedding device override.
-    pub device: Option<DeviceInput>,
     /// One primary hybrid-search group.
     #[schemars(length(max = 4000))]
     pub query: Option<String>,
@@ -637,7 +709,12 @@ pub struct SearchInput {
     pub preview: SearchPreview,
     /// Ordered path glob rules; later matching rules take precedence.
     #[schemars(length(max = 128))]
-    pub globs: Option<Vec<GlobInput>>,
+    pub globs: Option<GlobListInput>,
+    /// Ordered case-insensitive rg glob rules, applied after globs.
+    pub insensitive_globs: Option<PathListInput>,
+    /// Ripgrep type names, such as ts, py, h or cpp.
+    pub file_types: Option<PathListInput>,
+    pub excluded_file_types: Option<PathListInput>,
     /// Formats inferred from indexed file names, such as rust or markdown; source contents are not inspected.
     pub formats: Option<PathListInput>,
     /// Exclude matching file-name formats, taking precedence over formats.
@@ -699,7 +776,12 @@ pub struct IndexInput {
     /// Replace the index root-path configuration.
     pub reset_paths: Option<bool>,
     #[schemars(length(max = 128))]
-    pub globs: Option<Vec<GlobInput>>,
+    pub globs: Option<GlobListInput>,
+    /// Ordered case-insensitive rg glob rules, applied after globs.
+    pub insensitive_globs: Option<PathListInput>,
+    /// Ripgrep type names, such as ts, py, h or cpp.
+    pub file_types: Option<PathListInput>,
+    pub excluded_file_types: Option<PathListInput>,
     pub hidden: Option<bool>,
     pub no_ignore: Option<bool>,
     /// Whether indexing scans nested Git repositories and submodules.
@@ -710,6 +792,7 @@ pub struct IndexInput {
     #[schemars(range(min = 1))]
     #[serde(default, deserialize_with = "deserialize_optional_update")]
     pub max_file_size_bytes: Option<Option<u64>>,
+    #[serde(rename = "follow", alias = "followSymlinks")]
     pub follow_symlinks: Option<bool>,
     /// Embedding batch tasks processed concurrently during this update.
     #[schemars(range(min = 1))]
@@ -783,6 +866,71 @@ struct IndexOutput {
     /// Completed indexing statistics, timings and skipped files when debug is requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     debug: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scan_diagnostics: Option<ScanDiagnosticsOutput>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_field_names)] // Public field names follow the Node MCP contract.
+struct ScanDiagnosticsOutput {
+    skipped_files: usize,
+    skipped_by_reason: std::collections::BTreeMap<String, usize>,
+    skipped_samples: Vec<SkippedSampleOutput>,
+}
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkippedSampleOutput {
+    absolute_path: String,
+    relative_path: String,
+    reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit_bytes: Option<u64>,
+}
+fn scan_diagnostics(
+    root: &Path,
+    skipped: &[zg_engine::api::index::result::SkippedFile],
+    totals: &std::collections::BTreeMap<String, usize>,
+) -> ScanDiagnosticsOutput {
+    let mut counts: std::collections::BTreeMap<_, _> =
+        ["empty", "too_large", "unsupported", "binary"]
+            .into_iter()
+            .map(|reason| (reason.to_owned(), 0))
+            .collect();
+    let samples = skipped
+        .iter()
+        .enumerate()
+        .filter_map(|(index, file)| {
+            let reason = serde_json::to_value(file.reason)
+                .expect("skip reason")
+                .as_str()
+                .expect("reason name")
+                .to_owned();
+            *counts.entry(reason.clone()).or_default() += 1;
+            (index < 100).then(|| SkippedSampleOutput {
+                absolute_path: root.join(&file.path).display().to_string(),
+                relative_path: file
+                    .path
+                    .strip_prefix(root)
+                    .unwrap_or(&file.path)
+                    .display()
+                    .to_string(),
+                reason,
+                size_bytes: file.size_bytes,
+                limit_bytes: file.limit_bytes,
+            })
+        })
+        .collect();
+    if !totals.is_empty() {
+        counts.extend(totals.clone());
+    }
+    ScanDiagnosticsOutput {
+        skipped_files: counts.values().sum(),
+        skipped_by_reason: counts,
+        skipped_samples: samples,
+    }
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -869,7 +1017,15 @@ struct IndexRuntimeStatusOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     progress: Option<IndexJobProgressOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    completion: Option<IndexCompletionOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<IndexJobErrorOutput>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+struct IndexCompletionOutput {
+    completed: usize,
+    total: usize,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -905,6 +1061,7 @@ struct PersistentIndexStatusOutput {
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 struct WorkspaceIndexOutput {
+    id: String,
     name: String,
     path: String,
     root_paths: Vec<RootSpecOutput>,
@@ -924,7 +1081,11 @@ struct RootSpecOutput {
     absolute_path: String,
     recursive: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    globs: Vec<GlobInput>,
+    globs: Vec<String>,
+    insensitive_globs: Vec<String>,
+    file_types: Vec<String>,
+    excluded_file_types: Vec<String>,
+    glob_rules: Vec<GlobInput>,
     #[serde(skip_serializing_if = "is_false")]
     hidden: bool,
     #[serde(skip_serializing_if = "is_false")]
@@ -937,7 +1098,7 @@ struct RootSpecOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_file_size_bytes: Option<u64>,
     #[serde(skip_serializing_if = "is_false")]
-    follow_symlinks: bool,
+    follow: bool,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -1019,6 +1180,18 @@ impl QueryListInput {
         if values.len() > MAX_QUERY_GROUPS {
             return Err(format!("{name} accepts at most {MAX_QUERY_GROUPS} values"));
         }
+        for value in &values {
+            validate_text(
+                name,
+                value,
+                0,
+                if name == "queries" || name == "fts" || name == "vector" {
+                    MAX_QUERY_CHARS
+                } else {
+                    MAX_PATH_CHARS
+                },
+            )?;
+        }
         Ok(values
             .into_iter()
             .map(|value| value.trim().to_owned())
@@ -1042,6 +1215,18 @@ impl PathListInput {
         };
         if values.len() > MAX_PATH_FILTERS {
             return Err(format!("{name} accepts at most {MAX_PATH_FILTERS} values"));
+        }
+        for value in &values {
+            validate_text(
+                name,
+                value,
+                0,
+                if name == "queries" || name == "fts" || name == "vector" {
+                    MAX_QUERY_CHARS
+                } else {
+                    MAX_PATH_CHARS
+                },
+            )?;
         }
         Ok(values
             .into_iter()
@@ -1106,7 +1291,49 @@ const fn default_auto_update() -> bool {
     true
 }
 
-fn normalize_globs(input: Option<Vec<GlobInput>>) -> Result<Option<Vec<GlobRule>>, String> {
+fn normalize_globs(
+    input: Option<GlobListInput>,
+    insensitive: Option<PathListInput>,
+) -> Result<Option<Vec<GlobRule>>, String> {
+    let input = input
+        .map(|input| {
+            Ok::<_, String>(match input {
+                GlobListInput::One(pattern) => {
+                    normalize_path_list(Some(PathListInput::One(pattern)), "globs")?
+                        .into_iter()
+                        .map(|pattern| GlobInput {
+                            pattern,
+                            case_insensitive: false,
+                        })
+                        .collect()
+                }
+                GlobListInput::Strings(patterns) => {
+                    normalize_path_list(Some(PathListInput::Many(patterns)), "globs")?
+                        .into_iter()
+                        .map(|pattern| GlobInput {
+                            pattern,
+                            case_insensitive: false,
+                        })
+                        .collect()
+                }
+                GlobListInput::Rules(rules) => rules,
+            })
+        })
+        .transpose()?;
+    let input = if let Some(insensitive) = insensitive {
+        let mut rules = input.unwrap_or_default();
+        rules.extend(
+            normalize_path_list(Some(insensitive), "insensitiveGlobs")?
+                .into_iter()
+                .map(|pattern| GlobInput {
+                    pattern,
+                    case_insensitive: true,
+                }),
+        );
+        Some(rules)
+    } else {
+        input
+    };
     input
         .map(|rules| {
             if rules.len() > MAX_PATH_FILTERS {
@@ -1118,6 +1345,44 @@ fn normalize_globs(input: Option<Vec<GlobInput>>) -> Result<Option<Vec<GlobRule>
             Ok(rules.into_iter().map(Into::into).collect())
         })
         .transpose()
+}
+
+fn normalize_types(input: Option<PathListInput>, field: &str) -> Result<Vec<String>, String> {
+    let mut builder = ignore::types::TypesBuilder::new();
+    builder.add_defaults();
+    let definitions = builder.definitions();
+    let values: Vec<_> = normalize_path_list(input, field)?
+        .into_iter()
+        .map(|value| {
+            let name = value.to_lowercase();
+            if definitions
+                .iter()
+                .any(|definition| definition.name() == name)
+            {
+                return name;
+            }
+            match name.trim_start_matches('.') {
+                "bash" | "zsh" => "sh",
+                "cjs" | "jsx" | "mjs" => "js",
+                "cp" | "cc" | "cxx" => "cpp",
+                "hpp" | "hxx" | "hh" => "h",
+                "markdown" | "mdx" => "md",
+                "pyi" => "py",
+                "rb" => "ruby",
+                "rs" => "rust",
+                "tsx" => "ts",
+                "yml" => "yaml",
+                "cpp" | "h" | "js" | "py" | "ts" => name.trim_start_matches('.'),
+                _ => &name,
+            }
+            .to_owned()
+        })
+        .collect();
+    for value in &values {
+        builder.select(value);
+    }
+    builder.build().map_err(|error| error.to_string())?;
+    Ok(values)
 }
 
 fn normalize_formats(
@@ -1162,9 +1427,6 @@ fn normalize_filter_names<T>(
 impl SearchInput {
     fn into_request(self) -> Result<ContextOptions, String> {
         let root = absolute_root(&self.root)?;
-        if let Some(api_key) = &self.api_key {
-            validate_text("apiKey", api_key, 1, 8_192)?;
-        }
         if self
             .limit
             .is_some_and(|limit| limit == 0 || limit > MAX_SEARCH_LIMIT)
@@ -1218,7 +1480,12 @@ impl SearchInput {
             trace: self.trace.unwrap_or(false),
             prefer_symbol: self.prefer_symbol.unwrap_or(false),
             filter: QueryFilter {
-                globs: normalize_globs(self.globs)?.unwrap_or_default(),
+                file_types: normalize_types(self.file_types, "fileTypes")?,
+                excluded_file_types: normalize_types(
+                    self.excluded_file_types,
+                    "excludedFileTypes",
+                )?,
+                globs: normalize_globs(self.globs, self.insensitive_globs)?.unwrap_or_default(),
                 formats: normalize_formats(self.formats, "formats")?.unwrap_or_default(),
                 excluded_formats: normalize_formats(self.excluded_formats, "excludedFormats")?
                     .unwrap_or_default(),
@@ -1236,8 +1503,6 @@ impl SearchInput {
                 )?,
                 symbol_types: self.symbol_types.into_iter().map(Into::into).collect(),
             },
-            api_key: self.api_key,
-            device: self.device.map(Into::into),
             embedding_concurrency: self.embedding_concurrency,
             ..ContextOptions::default()
         };
@@ -1291,16 +1556,24 @@ impl IndexInput {
         }
         if let Some(endpoint) = &self.endpoint {
             validate_text("endpoint", endpoint, 1, 2_048)?;
-            if self.embedding.is_none() {
-                return Err("endpoint requires an explicit embedding model".to_owned());
+            let valid = endpoint.parse::<http::Uri>().is_ok_and(|uri| {
+                matches!(uri.scheme_str(), Some("http" | "https")) && uri.authority().is_some()
+            });
+            if !valid {
+                return Err("endpoint must be an absolute HTTP(S) URL".to_owned());
             }
-        }
-        if self.device.is_some() && self.embedding.is_none() {
-            return Err("device requires an explicit embedding model".to_owned());
         }
 
         let scan = ScanRulesUpdate {
-            globs: normalize_globs(self.globs)?,
+            file_types: self
+                .file_types
+                .map(|values| normalize_types(Some(values), "fileTypes"))
+                .transpose()?,
+            excluded_file_types: self
+                .excluded_file_types
+                .map(|values| normalize_types(Some(values), "excludedFileTypes"))
+                .transpose()?,
+            globs: normalize_globs(self.globs, self.insensitive_globs)?,
             hidden: self.hidden,
             no_ignore: self.no_ignore,
             nested_git: self.nested_git,
@@ -1359,6 +1632,9 @@ impl IndexInput {
             || self.rebuild.is_some()
             || self.reset_paths.is_some()
             || self.globs.is_some()
+            || self.insensitive_globs.is_some()
+            || self.file_types.is_some()
+            || self.excluded_file_types.is_some()
             || self.hidden.is_some()
             || self.no_ignore.is_some()
             || self.nested_git.is_some()
@@ -1598,7 +1874,7 @@ fn normalize_path_list(value: Option<PathListInput>, name: &str) -> Result<Vec<S
 }
 
 fn validate_text(name: &str, value: &str, min: usize, max: usize) -> Result<(), String> {
-    let length = value.chars().count();
+    let length = value.encode_utf16().count();
     if length < min || length > max {
         return Err(format!(
             "{name} must contain between {min} and {max} characters"
@@ -1700,6 +1976,11 @@ fn index_operation_to_result(reply: &IndexOperationResult, debug: bool) -> CallT
                 .map(FailedFileOutput::from)
                 .collect()
         }),
+        scan_diagnostics: reply
+            .result
+            .as_ref()
+            .filter(|_| debug)
+            .map(|result| scan_diagnostics(&reply.root, &result.skipped, &result.skipped_counts)),
         debug: reply.result.as_ref().filter(|_| debug).map(|result| {
             let mut diagnostics = result.clone();
             diagnostics.skipped.truncate(100);
@@ -1719,6 +2000,7 @@ fn drop_result_to_index_result(root: &Path, removed: bool) -> CallToolResult {
         error: None,
         failed_files: Vec::new(),
         debug: None,
+        scan_diagnostics: None,
     })
 }
 
@@ -1742,6 +2024,7 @@ impl From<InfoResult> for IndexStatusOutput {
     fn from(reply: InfoResult) -> Self {
         let status = reply.index_status().as_str().to_owned();
         let workspace_index = reply.workspace_index.map(|info| WorkspaceIndexOutput {
+            id: info.name.clone(),
             name: info.name,
             path: info.path.display().to_string(),
             root_paths: vec![RootSpecOutput::new(&info.root, info.scan)],
@@ -1802,7 +2085,32 @@ impl From<InfoResult> for IndexStatusOutput {
 
 impl From<IndexRuntimeSnapshot> for IndexRuntimeStatusOutput {
     fn from(runtime: IndexRuntimeSnapshot) -> Self {
+        let baseline = runtime
+            .index_status
+            .as_ref()
+            .and_then(|snapshot| snapshot.stats.as_ref())
+            .map(|stats| IndexCompletionOutput {
+                completed: stats.files_unchanged,
+                total: stats.files_scanned,
+            });
+        let completion = if runtime.job_state == Some(IndexOperationState::Running) {
+            runtime
+                .progress
+                .as_ref()
+                .and_then(|progress| {
+                    Some(IndexCompletionOutput {
+                        completed: progress
+                            .files_indexed?
+                            .saturating_sub(progress.files_failed.unwrap_or(0)),
+                        total: progress.files_total?,
+                    })
+                })
+                .map_or(baseline, Some)
+        } else {
+            baseline
+        };
         Self {
+            completion,
             index_status: runtime
                 .index_status
                 .map(|snapshot| IndexStatusSnapshotOutput {
@@ -1865,7 +2173,21 @@ impl RootSpecOutput {
         Self {
             absolute_path: root.display().to_string(),
             recursive: true,
-            globs: scan.globs.into_iter().map(Into::into).collect(),
+            globs: scan
+                .globs
+                .iter()
+                .filter(|rule| !rule.case_insensitive)
+                .map(|rule| rule.pattern.clone())
+                .collect(),
+            insensitive_globs: scan
+                .globs
+                .iter()
+                .filter(|rule| rule.case_insensitive)
+                .map(|rule| rule.pattern.clone())
+                .collect(),
+            glob_rules: scan.globs.into_iter().map(Into::into).collect(),
+            file_types: scan.file_types,
+            excluded_file_types: scan.excluded_file_types,
             hidden: scan.hidden,
             no_ignore: scan.no_ignore,
             nested_git: scan.nested_git,
@@ -1876,7 +2198,7 @@ impl RootSpecOutput {
                 .collect(),
             max_depth: scan.max_depth,
             max_file_size_bytes: scan.max_file_size_bytes,
-            follow_symlinks: scan.follow_symlinks,
+            follow: scan.follow_symlinks,
         }
     }
 }
@@ -1912,45 +2234,7 @@ const fn is_false(value: &bool) -> bool {
 }
 
 fn context_result_to_tool_result(reply: &ContextResult) -> CallToolResult {
-    CallToolResult::success(vec![ContentBlock::text(format_context_result(reply))])
-}
-
-fn format_context_result(reply: &ContextResult) -> String {
-    let freshness = if reply
-        .items
-        .iter()
-        .any(|item| item.status == ContextItemStatus::PossiblyStale)
-    {
-        "possibly_stale"
-    } else {
-        "fresh"
-    };
-    let freshness = reply.freshness.as_deref().unwrap_or(freshness);
-    let mut output = format!("freshness: {freshness}");
-    if let Some(refresh) = &reply.background_refresh {
-        let _ = write!(output, "\nbackground_refresh: {refresh}");
-    }
-    if reply.items.is_empty() {
-        let _ = write!(output, "\nNo matches.");
-        return output;
-    }
-    let mut items: Vec<&ContextItem> = reply.items.iter().collect();
-    items.sort_by_key(|item| item.rank);
-    for item in items {
-        let _ = write!(
-            output,
-            "\n\n#{} matchedBy={} {}:{}",
-            item.rank,
-            matched_by_label(item.matched_by),
-            item.relative_path.display(),
-            range_label(&item.range)
-        );
-        output.push_str("\nsource:");
-        for line in item.content.lines().take(10) {
-            let _ = write!(output, "\n  {}", truncate_line(line));
-        }
-    }
-    output
+    CallToolResult::success(vec![ContentBlock::text(rg_format::format(reply))])
 }
 
 fn matched_by_label(value: MatchedBy) -> &'static str {
@@ -1977,17 +2261,6 @@ fn range_label(range: &ContentRange) -> String {
             start_offset,
             end_offset,
         } => format!("bytes:{start_offset}-{end_offset}"),
-    }
-}
-
-fn truncate_line(line: &str) -> String {
-    const MAX_LINE_CHARS: usize = 160;
-    let mut chars = line.chars();
-    let prefix: String = chars.by_ref().take(MAX_LINE_CHARS).collect();
-    if chars.next().is_some() {
-        format!("{prefix}…")
-    } else {
-        prefix
     }
 }
 
@@ -2023,18 +2296,19 @@ mod tests {
     fn input() -> SearchInput {
         SearchInput {
             root: test_root().display().to_string(),
-            api_key: None,
-            device: None,
             query: Some("call chain".to_owned()),
             queries: None,
             fts: Some(QueryListInput::One("run".to_owned())),
             vector: None,
             limit: Some(8),
             preview: super::SearchPreview::Short,
-            globs: Some(vec![super::GlobInput {
+            globs: Some(super::GlobListInput::Rules(vec![super::GlobInput {
                 pattern: "*.rs".to_owned(),
                 case_insensitive: false,
-            }]),
+            }])),
+            insensitive_globs: None,
+            file_types: None,
+            excluded_file_types: None,
             formats: None,
             excluded_formats: None,
             categories: None,
@@ -2049,6 +2323,50 @@ mod tests {
             trace: Some(true),
             freshness: FreshnessInput::Eventual,
             auto_update: true,
+        }
+    }
+
+    #[test]
+    fn public_globs_types_and_follow_map_without_format_aliases() {
+        for globs in [
+            serde_json::json!(" *.h "),
+            serde_json::json!(["*.h", "!private/**"]),
+        ] {
+            let search: SearchInput = serde_json::from_value(serde_json::json!({"root":test_root(), "query":"needle", "globs":globs, "insensitiveGlobs":"src/**", "fileTypes":["H"], "excludedFileTypes":"cpp"})).expect("public search");
+            let request = search.into_request().expect("mapping");
+            assert_eq!(request.filter.globs[0].pattern, "*.h");
+            assert!(request.filter.globs.last().expect("iglob").case_insensitive);
+            assert_eq!(request.filter.file_types, ["h"]);
+            assert_eq!(request.filter.excluded_file_types, ["cpp"]);
+            assert!(request.filter.formats.is_empty());
+        }
+        let index: IndexInput = serde_json::from_value(
+            serde_json::json!({"root":test_root(), "globs":"*.h", "fileTypes":"h", "follow":true}),
+        )
+        .expect("index");
+        let IndexToolRequest::Index { options, wait, .. } = index.into_request().expect("mapping")
+        else {
+            panic!("index");
+        };
+        assert!(!wait);
+        assert_eq!(options.scan.follow_symlinks, Some(true));
+        assert_eq!(options.scan.file_types, Some(vec!["h".into()]));
+        for arguments in [
+            serde_json::json!({"fileTypes":"not-a-real-type"}),
+            serde_json::json!({"queries":[" ".repeat(4001)]}),
+            serde_json::json!({"globs":vec!["*.rs"; 129]}),
+        ] {
+            let mut value = serde_json::json!({"root":test_root(), "query":"needle"});
+            value
+                .as_object_mut()
+                .expect("object")
+                .extend(arguments.as_object().expect("object").clone());
+            assert!(
+                serde_json::from_value::<SearchInput>(value)
+                    .expect("typed input")
+                    .into_request()
+                    .is_err()
+            );
         }
     }
 
@@ -2169,7 +2487,7 @@ mod tests {
             workspace["fts"]["filters"],
             serde_json::json!(["lowercase"])
         );
-        assert!(workspace.get("id").is_none());
+        assert_eq!(workspace["id"], "search-engine");
         assert!(workspace.get("embeddings").is_none());
         assert!(workspace.get("embedding_routes").is_none());
         assert_eq!(files["entities"], count);
@@ -2186,7 +2504,7 @@ mod tests {
         let workspace_schema =
             serde_json::to_value(schemars::schema_for!(super::WorkspaceIndexOutput))
                 .expect("workspace schema");
-        assert!(workspace_schema["properties"].get("id").is_none());
+        assert_eq!(workspace_schema["properties"]["id"]["type"], "string");
     }
 
     #[test]
@@ -2213,13 +2531,16 @@ mod tests {
     }
 
     #[test]
-    fn search_accepts_all_supported_devices() {
-        for device in ["auto", "cpu", "metal", "vulkan", "cuda"] {
-            let mut search = input();
-            search.device =
-                Some(serde_json::from_value(serde_json::json!(device)).expect("device"));
-            let request = search.into_request().expect("device should map");
-            assert_eq!(serde_json::json!(request.device), device);
+    fn search_does_not_expose_runtime_credentials() {
+        let schema = serde_json::to_value(schemars::schema_for!(SearchInput)).expect("schema");
+        for field in ["apiKey", "device"] {
+            assert!(schema["properties"].get(field).is_none());
+            assert!(
+                serde_json::from_value::<SearchInput>(serde_json::json!({
+                    "root": test_root(), "query": "needle", field: "cpu"
+                }))
+                .is_err()
+            );
         }
     }
 
@@ -2275,6 +2596,16 @@ mod tests {
         reply.result = None;
         reply.state = super::IndexOperationState::Queued;
         assert!(output(&reply, true).get("debug").is_none());
+    }
+
+    #[test]
+    fn scan_diagnostics_counts_are_independent_of_bounded_samples() {
+        let totals = std::collections::BTreeMap::from([("empty".to_owned(), 123)]);
+        let diagnostics = super::scan_diagnostics(&test_root(), &[], &totals);
+        assert_eq!(diagnostics.skipped_files, 123);
+        assert_eq!(diagnostics.skipped_by_reason["empty"], 123);
+        assert_eq!(diagnostics.skipped_by_reason["binary"], 0);
+        assert!(diagnostics.skipped_samples.is_empty());
     }
 
     #[test]
@@ -2620,10 +2951,13 @@ mod tests {
             embedding: Some("potion-base-8M".to_owned()),
             rebuild: Some(false),
             reset_paths: None,
-            globs: Some(vec![super::GlobInput {
+            globs: Some(super::GlobListInput::Rules(vec![super::GlobInput {
                 pattern: "*.rs".to_owned(),
                 case_insensitive: false,
-            }]),
+            }])),
+            insensitive_globs: None,
+            file_types: None,
+            excluded_file_types: None,
             hidden: None,
             no_ignore: None,
             nested_git: None,
