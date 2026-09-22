@@ -7,3 +7,5 @@ mod pipeline;
 mod ranking;
 pub(crate) mod service;
 pub(crate) mod storage;
+
+pub(crate) mod writer;
