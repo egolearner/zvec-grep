@@ -65,7 +65,7 @@ fn start_on_available_port<T>(
             token_file: token_file.map(Path::to_owned),
             active: true,
         };
-        let log_path = home.path().join("daemon/server.log");
+        let log_path = home.path().join("daemon").join("bootstrap.log");
         let log_start = std::fs::metadata(&log_path).map_or(0, |metadata| metadata.len());
         match start(&guard.listen) {
             Ok(value) => return Ok((guard, value)),
@@ -197,7 +197,8 @@ impl StdioBridge {
     ) -> Result<Self, Box<dyn Error>> {
         let stderr = NamedTempFile::new()?;
         let daemon_log_start =
-            std::fs::metadata(home.join("daemon/server.log")).map_or(0, |metadata| metadata.len());
+            std::fs::metadata(home.join("daemon").join("logs").join("server.log"))
+                .map_or(0, |metadata| metadata.len());
         let mut command = Command::new(binary);
         command.env_remove("ZVEC_GREP_MCP_TOOLSET");
         command.args([
@@ -343,7 +344,7 @@ impl StdioBridge {
             Ok(None) => "running".to_owned(),
             Err(error) => format!("unavailable: {error}"),
         };
-        let log_path = self.home.join("daemon/server.log");
+        let log_path = self.home.join("daemon").join("logs").join("server.log");
         format!(
             "stdio response failed: {reason}; id={}, method={}, tool={}, choice={choice:?}, prompts={prompts}, elapsed={:?}, child={child_status}, last_message={last_message}\nbridge stderr:\n{}\ndaemon log ({}):\n{}",
             request["id"], request["method"], request["params"]["name"], started.elapsed(),
@@ -808,6 +809,14 @@ fn new_daemon_defaults_to_agent_without_a_toolset() -> Result<(), Box<dyn Error>
     })?;
     assert!(String::from_utf8_lossy(&output.stdout).contains("MCP toolset: agent"));
     assert_command_success(&guard.stop()?);
+    let log = std::fs::read_to_string(home.path().join("daemon").join("logs").join("server.log"))?;
+    assert!(
+        log.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|record| record["fields"]["message"] == "zvec-grep daemon ready")
+        }),
+        "{log}"
+    );
     Ok(())
 }
 
@@ -1054,7 +1063,10 @@ fn search_uses_workspace_runtime(toolset: &str) -> Result<(), Box<dyn Error>> {
         assert!(
             Instant::now() < deadline,
             "watcher did not refresh: {response}\n{}",
-            log_tail(&home.path().join("daemon/server.log"), 0)
+            log_tail(
+                &home.path().join("daemon").join("logs").join("server.log"),
+                0
+            )
         );
         std::thread::sleep(Duration::from_millis(50));
     }

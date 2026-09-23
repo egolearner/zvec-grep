@@ -3,7 +3,10 @@ use std::{
     io::{self, IsTerminal},
     path::Path,
     process::ExitCode,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 #[cfg(target_os = "macos")]
@@ -20,11 +23,15 @@ use zg_daemon::{DaemonStatus, ListenAddress, McpToolset as DaemonMcpToolset, Ser
 use zg_daemon_protocol::{DaemonCommand, DaemonReply};
 use zg_engine::{EngineError, ZvecGrep, api::context::ContextOptions};
 
+static DAEMON_LOGGING: AtomicBool = AtomicBool::new(false);
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            if let Some(error) = error.downcast_ref::<EngineError>() {
+            if DAEMON_LOGGING.load(Ordering::Relaxed) {
+                tracing::error!(%error, "daemon failed");
+            } else if let Some(error) = error.downcast_ref::<EngineError>() {
                 eprintln!("{}", error.report());
             } else {
                 eprintln!("Error: {error}");
@@ -71,7 +78,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         | CliPlan::Status { output, .. } => output.debug,
         _ => false,
     };
-    init_tracing(debug);
+    if let CliPlan::Server(ServerPlan::Run(args)) = &plan {
+        let home = zg_daemon::resolve_home(args.home.clone())?;
+        let options = zg_engine::config::daemon_log_options()?;
+        let log = zg_daemon::rolling_log::RollingLog::open(&home, options)?;
+        init_daemon_tracing(log, options.debug);
+        DAEMON_LOGGING.store(true, Ordering::Relaxed);
+    } else {
+        init_tracing(debug);
+    }
 
     let runtime = Builder::new_multi_thread().enable_all().build()?;
 
@@ -797,6 +812,20 @@ fn init_tracing(debug: bool) {
     });
     let _ = tracing_subscriber::fmt()
         .with_writer(io::stderr)
+        .with_env_filter(filter)
+        .try_init();
+}
+
+fn init_daemon_tracing(log: zg_daemon::rolling_log::RollingLog, debug: bool) {
+    let filter = EnvFilter::new(if debug {
+        "zg=debug,zg_engine=debug,zg_daemon=debug,zg_transport_mcp=debug"
+    } else {
+        "zg=info,zg_engine=info,zg_daemon=info,zg_transport_mcp=info"
+    });
+    let _ = tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_writer(move || log.writer())
         .with_env_filter(filter)
         .try_init();
 }
