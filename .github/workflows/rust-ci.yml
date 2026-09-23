@@ -108,10 +108,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-rust-cargo-v1-
       - name: Run workspace tests
-        if: runner.os != 'Windows'
         run: cargo test --locked --workspace --all-targets
-      - name: Run workspace tests on Windows
-        if: runner.os == 'Windows'
-        run: cargo test --locked --workspace --all-targets -- --test-threads=1
       - name: Smoke test the CLI
         run: cargo run --locked -p zg -- --rg "zvec-grep Rust rewrite" README.md
