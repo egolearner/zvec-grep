@@ -51,6 +51,7 @@ fn rpc(response: &str) -> serde_json::Value {
 
 #[test]
 fn modern_http_discovery_tools_errors_and_remote_continuation() -> Result<(), Box<dyn Error>> {
+    let _permit = server_test_permit();
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
     for toolset in ["agent", "full"] {
         let home = TempDir::new()?;

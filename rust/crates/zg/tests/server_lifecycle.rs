@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Output, Stdio},
     sync::{
-        Arc,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver},
     },
@@ -20,6 +20,37 @@ use serde_json::json;
 use tempfile::{NamedTempFile, TempDir};
 
 const SERVER_START_ATTEMPTS: usize = 5;
+// Each test can start several daemons and embedding servers. Keep unrelated
+// test binaries parallel while bounding contention within this binary.
+const MAX_CONCURRENT_SERVER_TESTS: usize = 2;
+static SERVER_TESTS: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+struct ServerTestPermit;
+
+fn server_test_permit() -> ServerTestPermit {
+    let (count, available) = &SERVER_TESTS;
+    let mut running = count
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while *running >= MAX_CONCURRENT_SERVER_TESTS {
+        running = available
+            .wait(running)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    *running += 1;
+    ServerTestPermit
+}
+
+impl Drop for ServerTestPermit {
+    fn drop(&mut self) {
+        let (count, available) = &SERVER_TESTS;
+        let mut running = count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *running -= 1;
+        available.notify_one();
+    }
+}
 
 struct ServerGuard {
     binary: PathBuf,
@@ -409,6 +440,7 @@ impl Drop for StdioBridge {
 #[test]
 fn server_start_retries_a_bind_race_without_stopping_the_port_owner() -> Result<(), Box<dyn Error>>
 {
+    let _permit = server_test_permit();
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
     let home = TempDir::new()?;
     let mut attempts = 0;
@@ -437,6 +469,7 @@ fn server_start_retries_a_bind_race_without_stopping_the_port_owner() -> Result<
 
 #[test]
 fn server_start_does_not_retry_unrelated_failures() -> Result<(), Box<dyn Error>> {
+    let _permit = server_test_permit();
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
     let home = TempDir::new()?;
     let mut attempts = 0;
@@ -452,6 +485,7 @@ fn server_start_does_not_retry_unrelated_failures() -> Result<(), Box<dyn Error>
 
 #[test]
 fn server_on_exposes_only_agent_search_and_off_stops_it() -> Result<(), Box<dyn Error>> {
+    let _permit = server_test_permit();
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
     let home = TempDir::new()?;
     let (mut guard, output) = start_server(&binary, &home, "agent", None, |_| {})?;
@@ -538,6 +572,7 @@ fn server_on_exposes_only_agent_search_and_off_stops_it() -> Result<(), Box<dyn 
 #[test]
 #[allow(clippy::too_many_lines)]
 fn full_toolset_exposes_lifecycle_tools_and_runs_managed_rg() -> Result<(), Box<dyn Error>> {
+    let _permit = server_test_permit();
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
     let home = TempDir::new()?;
     let workspace = TempDir::new()?;
@@ -814,6 +849,7 @@ fn full_toolset_exposes_lifecycle_tools_and_runs_managed_rg() -> Result<(), Box<
 
 #[test]
 fn new_daemon_defaults_to_agent_without_a_toolset() -> Result<(), Box<dyn Error>> {
+    let _permit = server_test_permit();
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
     let home = TempDir::new()?;
     let (mut guard, output) = start_on_available_port(&binary, &home, None, |listen| {
@@ -833,6 +869,7 @@ fn new_daemon_defaults_to_agent_without_a_toolset() -> Result<(), Box<dyn Error>
 #[test]
 fn default_connections_reuse_either_toolset_and_explicit_conflicts_fail()
 -> Result<(), Box<dyn Error>> {
+    let _permit = server_test_permit();
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
     for profile in ["agent", "full"] {
         let home = TempDir::new()?;
@@ -916,11 +953,13 @@ fn default_connections_reuse_either_toolset_and_explicit_conflicts_fail()
 
 #[test]
 fn agent_search_uses_workspace_runtime() -> Result<(), Box<dyn Error>> {
+    let _permit = server_test_permit();
     search_uses_workspace_runtime("agent")
 }
 
 #[test]
 fn full_search_uses_workspace_runtime() -> Result<(), Box<dyn Error>> {
+    let _permit = server_test_permit();
     search_uses_workspace_runtime("full")
 }
 
@@ -1093,6 +1132,7 @@ fn search_uses_workspace_runtime(toolset: &str) -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn concurrent_stdio_bootstraps_share_one_resident_daemon() -> Result<(), Box<dyn Error>> {
+    let _permit = server_test_permit();
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
     let home = TempDir::new()?;
     let (mut guard, mut bridges) = start_on_available_port(&binary, &home, None, |listen| {
@@ -1157,6 +1197,7 @@ fn concurrent_stdio_bootstraps_share_one_resident_daemon() -> Result<(), Box<dyn
     reason = "Exercise update, rebuild and drop in one resident daemon lifecycle"
 )]
 fn direct_writes_retire_daemon_read_sessions() -> Result<(), Box<dyn Error>> {
+    let _permit = server_test_permit();
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
     let home = TempDir::new()?;
     let workspace = TempDir::new()?;
@@ -1271,6 +1312,7 @@ fn direct_writes_retire_daemon_read_sessions() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn indexed_fragment_coordinates_survive_direct_server_and_mcp() -> Result<(), Box<dyn Error>> {
+    let _permit = server_test_permit();
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
     let home = TempDir::new()?;
     let workspace = TempDir::new()?;
@@ -1356,12 +1398,14 @@ fn indexed_fragment_coordinates_survive_direct_server_and_mcp() -> Result<(), Bo
 
 #[test]
 fn stdio_remote_consent_controls_transmission_and_persistence() -> Result<(), Box<dyn Error>> {
+    let _permit = server_test_permit();
     stdio_remote_consent("2025-11-25")
 }
 
 #[test]
 fn modern_stdio_remote_consent_controls_transmission_and_persistence() -> Result<(), Box<dyn Error>>
 {
+    let _permit = server_test_permit();
     stdio_remote_consent("2026-07-28")
 }
 
@@ -1599,6 +1643,7 @@ fn assert_command_success(output: &Output) {
 
 #[test]
 fn token_file_protects_daemon_requests_and_is_forwarded_to_child() -> Result<(), Box<dyn Error>> {
+    let _permit = server_test_permit();
     let home = TempDir::new()?;
     let token_file = home.path().join("token.txt");
     std::fs::write(&token_file, "test-token-012345678901234567890123456789\n")?;
