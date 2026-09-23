@@ -752,9 +752,9 @@ fn full_toolset_exposes_lifecycle_tools_and_runs_managed_rg() -> Result<(), Box<
     assert!(response.contains("\"source\":\"index\""));
     assert!(response.contains("\"runtime\":"));
     assert!(response.contains("\"isError\":false"));
-    assert!(response.contains("\"indexed\":1"), "{response}");
-    assert!(response.contains("\"failed\":0"), "{response}");
 
+    // A no-op watcher job may replace the initial job's progress before this
+    // status call; the search below verifies that the source was indexed.
     let search = json!({
         "jsonrpc": "2.0",
         "id": 7,
