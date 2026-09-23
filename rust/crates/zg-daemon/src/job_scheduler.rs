@@ -595,6 +595,10 @@ fn merge_options(current: &mut Option<IndexOptions>, mut incoming: IndexOptions)
     current.rebuild |= incoming.rebuild;
     merge_update(&mut current.scan.globs, incoming.scan.globs.take());
     merge_update(
+        &mut current.scan.insensitive_globs,
+        incoming.scan.insensitive_globs.take(),
+    );
+    merge_update(
         &mut current.scan.file_types,
         incoming.scan.file_types.take(),
     );
@@ -1801,6 +1805,36 @@ mod tests {
         assert_eq!(merged.embedding_concurrency, Some(8));
         assert_eq!(merged.lock_timeout_ms, Some(2_000));
         assert_eq!(merged.scan.globs, Some(Vec::new()));
+    }
+
+    #[test]
+    fn queued_glob_updates_keep_both_supplied_categories() {
+        let mut pending = Some(IndexOptions {
+            scan: ScanRulesUpdate {
+                globs: Some(vec!["*.rs".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        super::merge_options(
+            &mut pending,
+            IndexOptions {
+                scan: ScanRulesUpdate {
+                    insensitive_globs: Some(vec![zg_engine::api::index::options::GlobRule {
+                        pattern: "*.MD".into(),
+                        case_insensitive: true,
+                    }]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let mut scan = zg_engine::api::index::options::ScanRules::default();
+        pending.expect("merged request").scan.apply(&mut scan);
+        assert_eq!(scan.globs.len(), 2);
+        assert_eq!(scan.globs[0].pattern, "*.rs");
+        assert_eq!(scan.globs[1].pattern, "*.MD");
+        assert!(scan.globs[1].case_insensitive);
     }
 
     #[test]

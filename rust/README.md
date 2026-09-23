@@ -234,7 +234,8 @@ content, independently of the entity `range` and matched `excerpt_range`. CLI an
 MCP use these coordinates for source numbering; preview never infers a range from
 the number of content lines. The engine also interprets half-open line bounds.
 The required field changes the internal daemon reply contract. Version 13 also
-adds native ripgrep type filters to query and persisted scan rules.
+adds native ripgrep type filters to query and persisted scan rules. Version 14
+separates case-sensitive and case-insensitive glob updates on the daemon wire.
 Restart older resident daemons when updating the CLI; replies without
 `content_range` are rejected during deserialization. Direct and server rendering
 consume the same engine contract.

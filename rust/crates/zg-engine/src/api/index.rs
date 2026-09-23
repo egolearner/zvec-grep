@@ -82,6 +82,9 @@ pub mod options {
         pub excluded_file_types: Option<Vec<String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub globs: Option<Vec<GlobRule>>,
+        /// Replaces only case-insensitive rules when supplied separately.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub insensitive_globs: Option<Vec<GlobRule>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub hidden: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -114,8 +117,24 @@ pub mod options {
             if let Some(value) = &self.excluded_file_types {
                 target.excluded_file_types.clone_from(value);
             }
-            if let Some(value) = &self.globs {
-                target.globs.clone_from(value);
+            if self.globs.is_some() || self.insensitive_globs.is_some() {
+                let mut rules = self.globs.clone().unwrap_or_else(|| {
+                    target
+                        .globs
+                        .iter()
+                        .filter(|rule| !rule.case_insensitive)
+                        .cloned()
+                        .collect()
+                });
+                rules.extend(self.insensitive_globs.clone().unwrap_or_else(|| {
+                    target
+                        .globs
+                        .iter()
+                        .filter(|rule| rule.case_insensitive)
+                        .cloned()
+                        .collect()
+                }));
+                target.globs = rules;
             }
             if let Some(value) = self.hidden {
                 target.hidden = value;

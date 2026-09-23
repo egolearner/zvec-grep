@@ -182,6 +182,7 @@ pub struct IndexOperationResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexRuntimeSnapshot {
     pub index_status: Option<zg_engine::api::info::result::IndexStatusSnapshot>,
+    pub completion_baseline: Option<zg_engine::api::info::result::IndexStatusSnapshot>,
     pub watcher_active: bool,
     pub dirty_revision: u64,
     pub indexed_revision: u64,
@@ -1564,6 +1565,13 @@ impl IndexInput {
             }
         }
 
+        let globs = normalize_globs(self.globs, None)?;
+        let insensitive_globs = normalize_globs(None, self.insensitive_globs)?;
+        if globs.as_ref().map_or(0, Vec::len) + insensitive_globs.as_ref().map_or(0, Vec::len)
+            > MAX_PATH_FILTERS
+        {
+            return Err(format!("globs accepts at most {MAX_PATH_FILTERS} values"));
+        }
         let scan = ScanRulesUpdate {
             file_types: self
                 .file_types
@@ -1573,7 +1581,8 @@ impl IndexInput {
                 .excluded_file_types
                 .map(|values| normalize_types(Some(values), "excludedFileTypes"))
                 .transpose()?,
-            globs: normalize_globs(self.globs, self.insensitive_globs)?,
+            globs,
+            insensitive_globs,
             hidden: self.hidden,
             no_ignore: self.no_ignore,
             nested_git: self.nested_git,
@@ -2088,24 +2097,33 @@ impl From<IndexRuntimeSnapshot> for IndexRuntimeStatusOutput {
         let baseline = runtime
             .index_status
             .as_ref()
+            .or(runtime.completion_baseline.as_ref())
             .and_then(|snapshot| snapshot.stats.as_ref())
             .map(|stats| IndexCompletionOutput {
                 completed: stats.files_unchanged,
                 total: stats.files_scanned,
             });
         let completion = if runtime.job_state == Some(IndexOperationState::Running) {
-            runtime
-                .progress
-                .as_ref()
-                .and_then(|progress| {
+            let succeeded = runtime.progress.as_ref().and_then(|progress| {
+                progress
+                    .files_indexed
+                    .map(|indexed| indexed.saturating_sub(progress.files_failed.unwrap_or(0)))
+            });
+            match baseline {
+                Some(baseline) => Some(IndexCompletionOutput {
+                    completed: baseline
+                        .completed
+                        .saturating_add(succeeded.unwrap_or(0))
+                        .min(baseline.total),
+                    total: baseline.total,
+                }),
+                None => runtime.progress.as_ref().and_then(|progress| {
                     Some(IndexCompletionOutput {
-                        completed: progress
-                            .files_indexed?
-                            .saturating_sub(progress.files_failed.unwrap_or(0)),
+                        completed: succeeded?,
                         total: progress.files_total?,
                     })
-                })
-                .map_or(baseline, Some)
+                }),
+            }
         } else {
             baseline
         };
@@ -2721,6 +2739,95 @@ mod tests {
         assert_eq!(options.scan.ignore_files, Some(Vec::new()));
         assert_eq!(options.scan.max_depth, Some(None));
         assert_eq!(options.scan.max_file_size_bytes, Some(None));
+    }
+
+    #[test]
+    fn index_glob_updates_preserve_the_omitted_case_category() {
+        let sensitive = super::GlobRule::from("*.rs");
+        let insensitive = super::GlobRule {
+            pattern: "*.MD".to_owned(),
+            case_insensitive: true,
+        };
+        for (patch, expected) in [
+            (
+                serde_json::json!({"insensitiveGlobs": ["*.TXT"]}),
+                vec![
+                    sensitive.clone(),
+                    super::GlobRule {
+                        pattern: "*.TXT".to_owned(),
+                        case_insensitive: true,
+                    },
+                ],
+            ),
+            (
+                serde_json::json!({"globs": ["*.go"]}),
+                vec![super::GlobRule::from("*.go"), insensitive.clone()],
+            ),
+            (
+                serde_json::json!({"insensitiveGlobs": []}),
+                vec![sensitive.clone()],
+            ),
+            (serde_json::json!({"globs": []}), vec![insensitive.clone()]),
+        ] {
+            let mut input = patch;
+            input["root"] = serde_json::json!(test_root());
+            let parsed: IndexInput = serde_json::from_value(input).expect("index input");
+            let IndexToolRequest::Index { options, .. } =
+                parsed.into_request().expect("index request")
+            else {
+                panic!("index request expected");
+            };
+            let mut saved = super::ScanRules {
+                globs: vec![sensitive.clone(), insensitive.clone()],
+                ..Default::default()
+            };
+            options.scan.apply(&mut saved);
+            assert_eq!(saved.globs, expected);
+        }
+    }
+
+    #[test]
+    fn running_index_completion_includes_the_unchanged_baseline() {
+        use zg_engine::api::{
+            index::progress::{IndexProgress, IndexProgressPhase},
+            info::result::{IndexStats, IndexStatus, IndexStatusSnapshot},
+        };
+        let runtime = super::IndexRuntimeSnapshot {
+            index_status: Some(IndexStatusSnapshot {
+                status: IndexStatus::Stale,
+                stats: Some(IndexStats {
+                    files_scanned: 1001,
+                    files_unchanged: 1000,
+                    ..Default::default()
+                }),
+                checked_epoch_ms: 0,
+            }),
+            completion_baseline: None,
+            watcher_active: false,
+            dirty_revision: 0,
+            indexed_revision: 0,
+            active_job_id: None,
+            job_state: Some(super::IndexOperationState::Running),
+            progress: Some(IndexProgress {
+                phase: IndexProgressPhase::Indexing,
+                files_total: Some(1),
+                files_indexed: Some(1),
+                files_failed: Some(0),
+                detail: None,
+                embedding: None,
+            }),
+            error: None,
+        };
+        let output = super::IndexRuntimeStatusOutput::from(runtime.clone());
+        let completion = output.completion.expect("running completion");
+        assert_eq!((completion.completed, completion.total), (1001, 1001));
+
+        let mut detached = runtime;
+        detached.completion_baseline = detached.index_status.take();
+        let output = super::IndexRuntimeStatusOutput::from(detached);
+        assert!(output.index_status.is_none());
+        let completion = output.completion.expect("retained completion baseline");
+        assert_eq!((completion.completed, completion.total), (1001, 1001));
     }
 
     #[test]
