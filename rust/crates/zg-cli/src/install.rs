@@ -469,8 +469,8 @@ fn executable_available(name: &str) -> bool {
 }
 
 fn qoder_ide_available() -> bool {
-    if let Some(configured) = non_empty_env("QODER_IDE_EXECUTABLE") {
-        return executable_path(&absolute_path(&configured));
+    if let Some(configured) = trimmed_env_path("QODER_IDE_EXECUTABLE") {
+        return executable_path(&configured);
     }
     qoder_ide_candidates()
         .iter()
@@ -501,18 +501,15 @@ fn qoder_ide_candidates() -> Vec<PathBuf> {
         PathBuf::from("/Applications/Qoder.app/Contents/MacOS/Qoder"),
     ];
     #[cfg(windows)]
-    return vec![
-        PathBuf::from(
-            env::var_os("LOCALAPPDATA")
-                .unwrap_or_else(|| home.join("AppData/Local").into_os_string()),
-        )
-        .join("Programs/Qoder IDE/Qoder IDE.exe"),
-        PathBuf::from(
-            env::var_os("LOCALAPPDATA")
-                .unwrap_or_else(|| home.join("AppData/Local").into_os_string()),
-        )
-        .join("Programs/Qoder/Qoder.exe"),
-    ];
+    return qoder_ide_windows_candidates(
+        &home,
+        env::var_os("LOCALAPPDATA")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+        env::var_os("ProgramFiles")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+    );
     #[cfg(all(not(target_os = "macos"), not(windows)))]
     vec![
         PathBuf::from("/usr/share/qoder-ide/qoder-ide"),
@@ -520,6 +517,28 @@ fn qoder_ide_candidates() -> Vec<PathBuf> {
         PathBuf::from("/usr/bin/qoder-ide"),
         PathBuf::from("/usr/share/qoder/bin/qoder"),
     ]
+}
+
+#[cfg(any(windows, test))]
+fn qoder_ide_windows_candidates(
+    home: &Path,
+    local_app_data: Option<PathBuf>,
+    program_files: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let local_programs = local_app_data
+        .unwrap_or_else(|| home.join("AppData/Local"))
+        .join("Programs");
+    let mut candidates = vec![
+        local_programs.join("Qoder IDE/Qoder IDE.exe"),
+        local_programs.join("Qoder/Qoder.exe"),
+    ];
+    if let Some(program_files) = program_files {
+        candidates.extend([
+            program_files.join("Qoder IDE/Qoder IDE.exe"),
+            program_files.join("Qoder/Qoder.exe"),
+        ]);
+    }
+    candidates
 }
 
 #[derive(Default)]
@@ -1443,12 +1462,19 @@ fn env_path(name: &str) -> Option<PathBuf> {
 fn env_path_non_empty(name: &str) -> Option<PathBuf> {
     non_empty_env(name).map(absolute_path)
 }
+fn trimmed_env_path(name: &str) -> Option<PathBuf> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(absolute_path)
+}
 fn non_empty_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
 fn qoder_ide_path() -> PathBuf {
-    env_path_non_empty("QODER_IDE_MCP_PATH").unwrap_or_else(|| home_dir().join(".qoder/mcp.json"))
+    trimmed_env_path("QODER_IDE_MCP_PATH").unwrap_or_else(|| home_dir().join(".qoder/mcp.json"))
 }
 
 fn resolve_qwen_home() -> Result<PathBuf, InstallError> {
@@ -1903,17 +1929,21 @@ fn update_qoder_cli(path: &Path, options: &AgentOptions) -> Result<(), InstallEr
             owned.insert(permission.to_owned());
         }
     }
-    let mut always = current
-        .and_then(|server| server.get("alwaysAllow"))
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let mut always = if current_managed {
+        current
+            .and_then(|server| server.get("alwaysAllow"))
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     for tool in ["zvec_grep_search", "zvec_grep_rg"] {
         if !always.iter().any(|value| value == tool) {
             always.push(tool.to_owned());
@@ -2107,6 +2137,33 @@ mod tests {
         let agents = agents_from_tokens(&["cc,5,2".to_owned()], &BTreeSet::new()).expect("targets");
         assert_eq!(agents, vec![Agent::Claude, Agent::Codex, Agent::Qwen]);
         assert!(agents_from_tokens(&["qoder-ide".to_owned()], &BTreeSet::new()).is_err());
+    }
+
+    #[test]
+    fn windows_qoder_candidates_include_program_files_installations() {
+        let home = Path::new("home");
+        let local_app_data = PathBuf::from("local-app-data");
+        let program_files = PathBuf::from("program-files");
+        assert_eq!(
+            qoder_ide_windows_candidates(
+                home,
+                Some(local_app_data.clone()),
+                Some(program_files.clone())
+            ),
+            vec![
+                local_app_data.join("Programs/Qoder IDE/Qoder IDE.exe"),
+                local_app_data.join("Programs/Qoder/Qoder.exe"),
+                program_files.join("Qoder IDE/Qoder IDE.exe"),
+                program_files.join("Qoder/Qoder.exe"),
+            ]
+        );
+        assert_eq!(
+            qoder_ide_windows_candidates(home, None, None),
+            vec![
+                home.join("AppData/Local/Programs/Qoder IDE/Qoder IDE.exe"),
+                home.join("AppData/Local/Programs/Qoder/Qoder.exe"),
+            ]
+        );
     }
 
     #[test]
