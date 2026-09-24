@@ -79,13 +79,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         | CliPlan::Status { output, .. } => output.debug,
         _ => false,
     };
-    if let CliPlan::Server(ServerPlan::Run(args)) = &plan {
-        let home = zg_daemon::resolve_home(args.home.clone())?;
-        let options = zg_engine::config::daemon_log_options()?;
-        let log = zg_daemon::rolling_log::RollingLog::open(&home, options)?;
-        init_daemon_tracing(log, options.debug);
-        DAEMON_LOGGING.store(true, Ordering::Relaxed);
-    } else {
+    if !matches!(plan, CliPlan::Server(ServerPlan::Run(_))) {
         init_tracing(debug);
     }
 
@@ -764,7 +758,14 @@ async fn execute_server_plan(plan: ServerPlan) -> Result<(), Box<dyn Error>> {
         }
         ServerPlan::Run(args) => {
             let config = server_config(args)?;
-            zg_daemon::run_server(config, Arc::new(ZvecGrep::new())).await?;
+            zg_daemon::run_server_with_logging(config, Arc::new(ZvecGrep::new()), |home| {
+                let options = zg_engine::config::daemon_log_options()?;
+                let log = zg_daemon::rolling_log::RollingLog::open(home, options)?;
+                init_daemon_tracing(log, options.debug);
+                DAEMON_LOGGING.store(true, Ordering::Relaxed);
+                Ok(())
+            })
+            .await?;
         }
     }
     Ok(())

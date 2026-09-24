@@ -465,6 +465,56 @@ fn server_run_failure_is_written_to_bootstrap_and_rotating_logs() -> Result<(), 
 }
 
 #[test]
+fn duplicate_server_run_preserves_active_daemon_logs() -> Result<(), Box<dyn Error>> {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
+    let home = TempDir::new()?;
+    let config_home = TempDir::new()?;
+    let config_dir = config_home.path().join(".zvec-grep");
+    std::fs::create_dir_all(&config_dir)?;
+    std::fs::write(
+        config_dir.join("config.json"),
+        r#"{"version":1,"log":{"maxBytes":1,"keep":1}}"#,
+    )?;
+
+    let (mut guard, _) = start_server(&binary, &home, "agent", None, |command| {
+        command
+            .env("HOME", config_home.path())
+            .env("USERPROFILE", config_home.path());
+    })?;
+    let log_dir = home.path().join("daemon").join("logs");
+    let active_path = log_dir.join("server.log");
+    let backup_path = log_dir.join("server.log.1");
+    let active_before = std::fs::read(&active_path)?;
+    let backup_before = std::fs::read(&backup_path)?;
+    assert!(!backup_before.is_empty());
+
+    let duplicate = Command::new(&binary)
+        .env("HOME", config_home.path())
+        .env("USERPROFILE", config_home.path())
+        .args(["--server", "run", "--home"])
+        .arg(home.path())
+        .args(["--listen", &guard.listen])
+        .output()?;
+    assert!(!duplicate.status.success());
+    assert!(
+        String::from_utf8_lossy(&duplicate.stderr).contains("already running"),
+        "{}",
+        String::from_utf8_lossy(&duplicate.stderr)
+    );
+    assert_eq!(std::fs::read(&active_path)?, active_before);
+    assert_eq!(std::fs::read(&backup_path)?, backup_before);
+
+    let status = Command::new(&binary)
+        .args(["--server", "status", "--home"])
+        .arg(home.path())
+        .arg("--check-ready")
+        .output()?;
+    assert_command_success(&status);
+    assert_command_success(&guard.stop()?);
+    Ok(())
+}
+
+#[test]
 fn server_on_exposes_only_agent_search_and_off_stops_it() -> Result<(), Box<dyn Error>> {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
     let home = TempDir::new()?;

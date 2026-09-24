@@ -14,7 +14,14 @@ mod runtime;
 mod stdio;
 mod workspace_runtime;
 
-use std::{fmt, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 pub use controller::{
     DaemonInstanceRecord, DaemonStatus, start_server, stop_server, stop_server_with_token,
@@ -249,7 +256,20 @@ pub async fn index_with_progress(
 ///
 /// Returns lifecycle, bind, state-file, or HTTP server errors.
 pub async fn run_server(config: ServerConfig, engine: Arc<ZvecGrep>) -> Result<(), DaemonError> {
-    runtime::run_server(config, engine).await
+    runtime::run_server(config, engine, |_| Ok(())).await
+}
+
+/// Runs the daemon and initializes its logging after acquiring the instance record.
+///
+/// # Errors
+///
+/// Returns lifecycle, logging, bind, state-file, or HTTP server errors.
+pub async fn run_server_with_logging(
+    config: ServerConfig,
+    engine: Arc<ZvecGrep>,
+    init_logging: impl FnOnce(&Path) -> Result<(), DaemonError>,
+) -> Result<(), DaemonError> {
+    runtime::run_server(config, engine, init_logging).await
 }
 
 #[must_use]
