@@ -433,6 +433,38 @@ fn server_start_does_not_retry_unrelated_failures() -> Result<(), Box<dyn Error>
 }
 
 #[test]
+fn server_run_failure_is_written_to_bootstrap_and_rotating_logs() -> Result<(), Box<dyn Error>> {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
+    let home = TempDir::new()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let listen = listener.local_addr()?.to_string();
+    let daemon_dir = home.path().join("daemon");
+    std::fs::create_dir_all(&daemon_dir)?;
+    let bootstrap_path = daemon_dir.join("bootstrap.log");
+    let output = Command::new(&binary)
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .args(["--server", "run", "--home"])
+        .arg(home.path())
+        .args(["--listen", &listen])
+        .stderr(Stdio::from(std::fs::File::create(&bootstrap_path)?))
+        .output()?;
+    assert!(!output.status.success());
+
+    let bootstrap = std::fs::read_to_string(&bootstrap_path)?;
+    assert!(bootstrap.contains("Error:"), "{bootstrap}");
+    let log = std::fs::read_to_string(daemon_dir.join("logs").join("server.log"))?;
+    assert!(
+        log.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|record| record["fields"]["message"] == "daemon failed")
+        }),
+        "{log}"
+    );
+    Ok(())
+}
+
+#[test]
 fn server_on_exposes_only_agent_search_and_off_stops_it() -> Result<(), Box<dyn Error>> {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
     let home = TempDir::new()?;

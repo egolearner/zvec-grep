@@ -29,12 +29,13 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            if DAEMON_LOGGING.load(Ordering::Relaxed) {
-                tracing::error!(%error, "daemon failed");
-            } else if let Some(error) = error.downcast_ref::<EngineError>() {
+            if let Some(error) = error.downcast_ref::<EngineError>() {
                 eprintln!("{}", error.report());
             } else {
                 eprintln!("Error: {error}");
+            }
+            if DAEMON_LOGGING.load(Ordering::Relaxed) {
+                tracing::error!(%error, "daemon failed");
             }
             ExitCode::FAILURE
         }
