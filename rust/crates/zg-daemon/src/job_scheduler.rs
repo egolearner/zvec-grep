@@ -879,7 +879,7 @@ fn redact_assigned_value(message: &str, name: &str, allow_spaces: bool) -> Strin
         let value_end = if allow_spaces {
             quoted_or_line_end(output.as_bytes(), value_start)
         } else {
-            quoted_or_token_end(output.as_bytes(), value_start)
+            quoted_or_assigned_value_end(output.as_bytes(), value_start)
         };
         if value_start == value_end {
             cursor = name_end;
@@ -933,6 +933,19 @@ fn quoted_or_token_end(bytes: &[u8], cursor: usize) -> usize {
         while bytes.get(end).is_some_and(|byte| {
             !byte.is_ascii_whitespace() && !matches!(byte, b'"' | b'\'' | b',' | b';' | b'&')
         }) {
+            end += 1;
+        }
+        end
+    })
+}
+
+fn quoted_or_assigned_value_end(bytes: &[u8], cursor: usize) -> usize {
+    quoted_end(bytes, cursor).unwrap_or_else(|| {
+        let mut end = cursor;
+        while bytes
+            .get(end)
+            .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'&')
+        {
             end += 1;
         }
         end
@@ -2410,6 +2423,16 @@ mod tests {
             assert!(!redacted.contains(credential), "leaked {credential}");
         }
         assert_eq!(redacted.matches("[redacted]").count(), 8);
+    }
+
+    #[test]
+    fn assigned_credentials_include_punctuation_until_whitespace_or_ampersand() {
+        assert_eq!(
+            redact_job_error_text(
+                "password=abc,def;ghi status=401 api_key=jkl,mno;pqr&other=retained"
+            ),
+            "password=[redacted] status=401 api_key=[redacted]&other=retained"
+        );
     }
 
     #[test]
