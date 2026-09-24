@@ -113,7 +113,7 @@ impl Drop for ActivityGuard {
 
 fn guarded<S: Stream<Item = ServerSseMessage> + Send + Sync + 'static>(
     stream: S,
-    guard: ActivityGuard,
+    guard: Option<ActivityGuard>,
 ) -> impl Stream<Item = ServerSseMessage> + Send + Sync + 'static {
     futures::stream::unfold(
         (Box::pin(stream), guard),
@@ -183,7 +183,10 @@ impl SessionManager for BoundedSessionManager {
         message: ClientJsonRpcMessage,
     ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
         let guard = self.enter(id)?;
-        Ok(guarded(self.inner.create_stream(id, message).await?, guard))
+        Ok(guarded(
+            self.inner.create_stream(id, message).await?,
+            Some(guard),
+        ))
     }
 
     async fn accept_message(
@@ -210,7 +213,10 @@ impl SessionManager for BoundedSessionManager {
         last_event_id: String,
     ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
         let guard = self.enter(id)?;
-        Ok(guarded(self.inner.resume(id, last_event_id).await?, guard))
+        // Local event IDs include a request suffix only for request-bound streams.
+        let request_stream = last_event_id.contains('/');
+        let stream = self.inner.resume(id, last_event_id).await?;
+        Ok(guarded(stream, request_stream.then_some(guard)))
     }
 }
 
@@ -242,5 +248,58 @@ mod tests {
                 .await
                 .expect("expires after completion")
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resumed_notification_stream_does_not_block_idle_expiry() {
+        use rmcp::transport::Transport;
+
+        let manager = BoundedSessionManager::new(1, Duration::from_secs(60));
+        let (id, mut transport) = manager.create_session().await.expect("first session");
+        let initialize = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "1.0"}
+            }
+        }))
+        .expect("initialize request");
+        let (initialized, ()) = tokio::join!(manager.initialize_session(&id, initialize), async {
+            transport
+                .receive()
+                .await
+                .expect("worker receives initialization");
+            let response = serde_json::from_value(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "serverInfo": {"name": "test", "version": "1.0"}
+                }
+            }))
+            .expect("initialize response");
+            transport
+                .send(response)
+                .await
+                .expect("worker sends initialization");
+        });
+        initialized.expect("session initialized");
+
+        let _stream = manager
+            .resume(&id, "0".to_owned())
+            .await
+            .expect("resume notification stream");
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(
+            !manager
+                .has_session(&id)
+                .await
+                .expect("idle session expires")
+        );
+        manager.create_session().await.expect("capacity recovered");
     }
 }
