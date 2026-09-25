@@ -74,10 +74,16 @@ impl ServerStatusProvider for RuntimeStatusProvider {
 pub(crate) async fn run_server(
     config: ServerConfig,
     engine: Arc<ZvecGrep>,
+    init_logging: impl FnOnce(&std::path::Path) -> Result<(), DaemonError>,
 ) -> Result<(), DaemonError> {
+    let idle_ttl = crate::configured_watcher_idle_timeout()?;
     engine.enable_read_session_cache()?;
     let token = crate::resolve_token(config.token_file.as_deref())?;
     let mut instance = InstanceLock::acquire(&config).await?;
+    if let Err(error) = init_logging(&config.home) {
+        instance.release().await?;
+        return Err(error);
+    }
     let listener = match tokio::net::TcpListener::bind(config.listen.socket_addr()).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -93,7 +99,7 @@ pub(crate) async fn run_server(
         }
     };
     let shutdown = CancellationToken::new();
-    let runtimes = WorkspaceRuntimeManager::native(Arc::clone(&engine));
+    let runtimes = WorkspaceRuntimeManager::native_with_idle_ttl(Arc::clone(&engine), idle_ttl);
     let status: Arc<dyn ServerStatusProvider> = Arc::new(RuntimeStatusProvider {
         started: Instant::now(),
         shutdown: shutdown.clone(),

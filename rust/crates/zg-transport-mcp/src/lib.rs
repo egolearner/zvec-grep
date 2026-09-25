@@ -1798,7 +1798,11 @@ fn scan_rg_command(command: &str) -> Result<Vec<String>, String> {
             continue;
         }
         if character == '\\' {
-            escaping = true;
+            if cfg!(windows) {
+                token.push(character);
+            } else {
+                escaping = true;
+            }
             token_started = true;
             continue;
         }
@@ -2549,16 +2553,33 @@ mod tests {
     }
 
     #[test]
-    fn search_does_not_expose_runtime_credentials() {
-        let schema = serde_json::to_value(schemars::schema_for!(SearchInput)).expect("schema");
-        for field in ["apiKey", "device"] {
-            assert!(schema["properties"].get(field).is_none());
+    fn public_search_rejects_runtime_overrides() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(SearchInput)).expect("search schema");
+        assert!(schema["properties"].get("apiKey").is_none());
+        assert!(schema["properties"].get("device").is_none());
+
+        for (field, value) in [("apiKey", "secret"), ("device", "cpu")] {
             assert!(
                 serde_json::from_value::<SearchInput>(serde_json::json!({
-                    "root": test_root(), "query": "needle", field: "cpu"
+                    "root": test_root(), "query": "needle", (field): value
                 }))
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn index_accepts_all_supported_devices() {
+        for device in ["auto", "cpu", "metal", "vulkan", "cuda"] {
+            let mut index = index_input();
+            index.device = Some(serde_json::from_value(serde_json::json!(device)).expect("device"));
+            let IndexToolRequest::Index { options, .. } =
+                index.into_request().expect("device should map")
+            else {
+                panic!("index options should create an index request");
+            };
+            assert_eq!(serde_json::json!(options.device), device);
         }
     }
 
@@ -2980,6 +3001,24 @@ mod tests {
                 .expect("required properties")
                 .iter()
                 .any(|field| field == "name")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rg_command_preserves_unquoted_windows_path_separators() {
+        assert_eq!(
+            super::scan_rg_command(r"rg needle src\cli").expect("managed rg command"),
+            ["rg", "needle", r"src\cli"]
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn rg_command_preserves_unquoted_shell_escapes() {
+        assert_eq!(
+            super::scan_rg_command(r"rg needle src\ cli").expect("managed rg command"),
+            ["rg", "needle", "src cli"]
         );
     }
 

@@ -10,11 +10,19 @@ pub use authentication::resolve_token;
 mod http_client;
 mod job_scheduler;
 mod mcp_sessions;
+pub mod rolling_log;
 mod runtime;
 mod stdio;
 mod workspace_runtime;
 
-use std::{fmt, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 pub use controller::{
     DaemonInstanceRecord, DaemonStatus, start_server, stop_server, stop_server_with_token,
@@ -26,6 +34,8 @@ use zg_engine::ZvecGrep;
 pub use zg_transport_mcp::McpToolset;
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7999";
+const WATCHER_IDLE_TIMEOUT_SECONDS_ENV: &str = "ZVEC_GREP_WATCHER_IDLE_TIMEOUT_SECONDS";
+const MAX_TIMER_DELAY_SECONDS: u64 = 2_147_483_647 / 1_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListenAddress {
@@ -125,6 +135,10 @@ pub enum DaemonError {
     InstanceChanged { pid: u32 },
     #[error("invalid daemon instance record at {0}")]
     InvalidRecord(PathBuf),
+    #[error(
+        "ZVEC_GREP_WATCHER_IDLE_TIMEOUT_SECONDS must be an integer between 0 and 2147483; 0 disables idle watcher eviction"
+    )]
+    InvalidWatcherIdleTimeout,
     #[error("daemon I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("daemon state serialization failed: {0}")]
@@ -242,6 +256,39 @@ pub async fn index_with_progress(
     }
 }
 
+fn configured_watcher_idle_timeout() -> Result<Option<Duration>, DaemonError> {
+    configured_watcher_idle_timeout_value(std::env::var_os(WATCHER_IDLE_TIMEOUT_SECONDS_ENV))
+}
+
+fn configured_watcher_idle_timeout_value(
+    configured: Option<std::ffi::OsString>,
+) -> Result<Option<Duration>, DaemonError> {
+    let Some(configured) = configured else {
+        return Ok(Some(
+            workspace_runtime::WorkspaceRuntimeManager::DEFAULT_IDLE_TTL,
+        ));
+    };
+    let configured = configured
+        .to_str()
+        .ok_or(DaemonError::InvalidWatcherIdleTimeout)?
+        .trim();
+    if configured.is_empty() {
+        return Ok(Some(
+            workspace_runtime::WorkspaceRuntimeManager::DEFAULT_IDLE_TTL,
+        ));
+    }
+    if !configured.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(DaemonError::InvalidWatcherIdleTimeout);
+    }
+    let seconds = configured
+        .parse::<u64>()
+        .map_err(|_| DaemonError::InvalidWatcherIdleTimeout)?;
+    if seconds > MAX_TIMER_DELAY_SECONDS {
+        return Err(DaemonError::InvalidWatcherIdleTimeout);
+    }
+    Ok((seconds != 0).then(|| Duration::from_secs(seconds)))
+}
+
 /// Runs the resident HTTP daemon until local shutdown or an OS termination
 /// signal, then releases its instance record.
 ///
@@ -249,7 +296,20 @@ pub async fn index_with_progress(
 ///
 /// Returns lifecycle, bind, state-file, or HTTP server errors.
 pub async fn run_server(config: ServerConfig, engine: Arc<ZvecGrep>) -> Result<(), DaemonError> {
-    runtime::run_server(config, engine).await
+    runtime::run_server(config, engine, |_| Ok(())).await
+}
+
+/// Runs the daemon and initializes its logging after acquiring the instance record.
+///
+/// # Errors
+///
+/// Returns lifecycle, logging, bind, state-file, or HTTP server errors.
+pub async fn run_server_with_logging(
+    config: ServerConfig,
+    engine: Arc<ZvecGrep>,
+    init_logging: impl FnOnce(&Path) -> Result<(), DaemonError>,
+) -> Result<(), DaemonError> {
+    runtime::run_server(config, engine, init_logging).await
 }
 
 #[must_use]
@@ -259,9 +319,12 @@ pub const fn default_stop_timeout() -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{ffi::OsString, str::FromStr, time::Duration};
 
-    use super::ListenAddress;
+    use super::{
+        ListenAddress, configured_watcher_idle_timeout_value,
+        workspace_runtime::WorkspaceRuntimeManager,
+    };
 
     #[test]
     fn listen_address_accepts_only_loopback() {
@@ -270,5 +333,29 @@ mod tests {
         assert!(ListenAddress::from_str("[::1]:7999").is_ok());
         assert!(ListenAddress::from_str("0.0.0.0:7999").is_err());
         assert!(ListenAddress::from_str("127.0.0.1:0").is_err());
+    }
+
+    #[test]
+    fn watcher_idle_timeout_matches_node_environment_semantics() {
+        assert_eq!(
+            configured_watcher_idle_timeout_value(None).expect("default timeout"),
+            Some(WorkspaceRuntimeManager::DEFAULT_IDLE_TTL)
+        );
+        assert_eq!(
+            configured_watcher_idle_timeout_value(Some(OsString::from(" 15 ")))
+                .expect("configured timeout"),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(
+            configured_watcher_idle_timeout_value(Some(OsString::from("0")))
+                .expect("disabled timeout"),
+            None
+        );
+        for invalid in ["-1", "1.5", "2147484", "seconds"] {
+            assert!(
+                configured_watcher_idle_timeout_value(Some(OsString::from(invalid))).is_err(),
+                "{invalid} must be rejected"
+            );
+        }
     }
 }
