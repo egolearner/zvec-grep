@@ -80,8 +80,12 @@ pub mod options {
         pub file_types: Option<Vec<String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub excluded_file_types: Option<Vec<String>>,
+        /// Replaces the complete ordered list, including both case categories.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub globs: Option<Vec<GlobRule>>,
+        /// Replaces only case-sensitive rules when supplied separately.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub sensitive_globs: Option<Vec<GlobRule>>,
         /// Replaces only case-insensitive rules when supplied separately.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub insensitive_globs: Option<Vec<GlobRule>>,
@@ -117,8 +121,11 @@ pub mod options {
             if let Some(value) = &self.excluded_file_types {
                 target.excluded_file_types.clone_from(value);
             }
-            if self.globs.is_some() || self.insensitive_globs.is_some() {
-                let mut rules = self.globs.clone().unwrap_or_else(|| {
+            if let Some(rules) = &self.globs {
+                target.globs.clone_from(rules);
+            }
+            if self.sensitive_globs.is_some() || self.insensitive_globs.is_some() {
+                let mut rules = self.sensitive_globs.clone().unwrap_or_else(|| {
                     target
                         .globs
                         .iter()
@@ -200,6 +207,30 @@ pub mod options {
     #[cfg(test)]
     mod selection_update_tests {
         use super::*;
+
+        #[test]
+        fn complete_glob_updates_replace_old_rules_and_preserve_order() {
+            let mut scan = ScanRules {
+                globs: vec![GlobRule {
+                    pattern: "!secret/**".to_owned(),
+                    case_insensitive: true,
+                }],
+                ..Default::default()
+            };
+            let replacement = vec![GlobRule::from("secret/**")];
+            ScanRulesUpdate {
+                globs: Some(replacement.clone()),
+                ..Default::default()
+            }
+            .apply(&mut scan);
+            assert_eq!(scan.globs, replacement);
+            ScanRulesUpdate {
+                globs: Some(Vec::new()),
+                ..Default::default()
+            }
+            .apply(&mut scan);
+            assert!(scan.globs.is_empty());
+        }
 
         #[test]
         fn updates_preserve_omission_and_apply_false_empty_and_null() {

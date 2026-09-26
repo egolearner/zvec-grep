@@ -2168,6 +2168,30 @@ mod tests {
     }
 
     #[test]
+    fn cli_glob_list_replaces_saved_insensitive_rules() {
+        let rules = vec![
+            super::GlobRule::from("secret/**"),
+            super::GlobRule {
+                pattern: "*.MD".to_owned(),
+                case_insensitive: true,
+            },
+        ];
+        let args = super::ScanArgs {
+            glob_rules: rules.clone(),
+            ..Default::default()
+        };
+        let mut scan = zg_engine::api::index::options::ScanRules {
+            globs: vec![super::GlobRule {
+                pattern: "!secret/**".to_owned(),
+                case_insensitive: true,
+            }],
+            ..Default::default()
+        };
+        args.update().apply(&mut scan);
+        assert_eq!(scan.globs, rules);
+    }
+
+    #[test]
     fn parses_index_options_into_engine_request() {
         let cli = Cli::try_parse_from([
             "zg",

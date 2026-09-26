@@ -1292,6 +1292,35 @@ const fn default_auto_update() -> bool {
     true
 }
 
+fn normalize_index_globs(
+    input: Option<GlobListInput>,
+    insensitive: Option<PathListInput>,
+) -> Result<ScanRulesUpdate, String> {
+    let complete_globs = matches!(&input, Some(GlobListInput::Rules(_)));
+    let (globs, sensitive_globs, insensitive_globs) = if complete_globs {
+        (normalize_globs(input, insensitive)?, None, None)
+    } else {
+        (
+            None,
+            normalize_globs(input, None)?,
+            normalize_globs(None, insensitive)?,
+        )
+    };
+    if globs.as_ref().map_or(0, Vec::len)
+        + sensitive_globs.as_ref().map_or(0, Vec::len)
+        + insensitive_globs.as_ref().map_or(0, Vec::len)
+        > MAX_PATH_FILTERS
+    {
+        return Err(format!("globs accepts at most {MAX_PATH_FILTERS} values"));
+    }
+    Ok(ScanRulesUpdate {
+        globs,
+        sensitive_globs,
+        insensitive_globs,
+        ..Default::default()
+    })
+}
+
 fn normalize_globs(
     input: Option<GlobListInput>,
     insensitive: Option<PathListInput>,
@@ -1565,13 +1594,7 @@ impl IndexInput {
             }
         }
 
-        let globs = normalize_globs(self.globs, None)?;
-        let insensitive_globs = normalize_globs(None, self.insensitive_globs)?;
-        if globs.as_ref().map_or(0, Vec::len) + insensitive_globs.as_ref().map_or(0, Vec::len)
-            > MAX_PATH_FILTERS
-        {
-            return Err(format!("globs accepts at most {MAX_PATH_FILTERS} values"));
-        }
+        let glob_update = normalize_index_globs(self.globs, self.insensitive_globs)?;
         let scan = ScanRulesUpdate {
             file_types: self
                 .file_types
@@ -1581,8 +1604,6 @@ impl IndexInput {
                 .excluded_file_types
                 .map(|values| normalize_types(Some(values), "excludedFileTypes"))
                 .transpose()?,
-            globs,
-            insensitive_globs,
             hidden: self.hidden,
             no_ignore: self.no_ignore,
             nested_git: self.nested_git,
@@ -1596,6 +1617,7 @@ impl IndexInput {
             max_depth: self.max_depth,
             max_file_size_bytes: self.max_file_size_bytes,
             follow_symlinks: self.follow_symlinks,
+            ..glob_update
         };
         if let Some(paths) = &scan.ignore_files {
             validate_scoped_paths(&root, paths, "ignore file")?;
@@ -2752,7 +2774,7 @@ mod tests {
         else {
             panic!("index");
         };
-        assert_eq!(options.scan.globs, Some(Vec::new()));
+        assert_eq!(options.scan.sensitive_globs, Some(Vec::new()));
         assert_eq!(options.scan.hidden, Some(false));
         assert_eq!(options.scan.follow_symlinks, Some(false));
         assert_eq!(options.scan.nested_git, Some(false));
@@ -2760,6 +2782,42 @@ mod tests {
         assert_eq!(options.scan.ignore_files, Some(Vec::new()));
         assert_eq!(options.scan.max_depth, Some(None));
         assert_eq!(options.scan.max_file_size_bytes, Some(None));
+    }
+
+    #[test]
+    fn typed_index_globs_replace_the_complete_saved_list() {
+        let parsed: IndexInput = serde_json::from_value(serde_json::json!({
+            "root": test_root(),
+            "globs": [{"pattern": "*.MD", "caseInsensitive": true}, {"pattern": "secret/**"}],
+            "insensitiveGlobs": ["notes/**"]
+        }))
+        .expect("typed globs");
+        let IndexToolRequest::Index { options, .. } = parsed.into_request().expect("request")
+        else {
+            panic!("index request expected");
+        };
+        let mut scan = super::ScanRules {
+            globs: vec![super::GlobRule {
+                pattern: "!secret/**".to_owned(),
+                case_insensitive: true,
+            }],
+            ..Default::default()
+        };
+        options.scan.apply(&mut scan);
+        assert_eq!(
+            scan.globs,
+            vec![
+                super::GlobRule {
+                    pattern: "*.MD".to_owned(),
+                    case_insensitive: true
+                },
+                super::GlobRule::from("secret/**"),
+                super::GlobRule {
+                    pattern: "notes/**".to_owned(),
+                    case_insensitive: true
+                },
+            ]
+        );
     }
 
     #[test]

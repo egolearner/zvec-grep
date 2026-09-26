@@ -249,6 +249,7 @@ the number of content lines. The engine also interprets half-open line bounds.
 The required field changes the internal daemon reply contract. Version 13 also
 adds native ripgrep type filters to query and persisted scan rules. Version 14
 separates case-sensitive and case-insensitive glob updates on the daemon wire.
+Version 15 distinguishes complete ordered glob replacement from category updates.
 Restart older resident daemons when updating the CLI; replies without
 `content_range` are rejected during deserialization. Direct and server rendering
 consume the same engine contract.
@@ -260,7 +261,9 @@ index provenance without verified freshness is conservatively shown as
 `possibly_stale`; a successful waited refresh reports `fresh`.
 
 Search and index accept `globs` and `insensitiveGlobs` as a string or list;
-case-insensitive rules follow case-sensitive rules. `fileTypes` and
+case-insensitive string rules follow case-sensitive string rules. Index string
+parameters update only the supplied case category. Typed glob lists and CLI glob
+arguments replace the complete ordered list. `fileTypes` and
 `excludedFileTypes` use the embedded ripgrep catalog, including `h`, `cpp`, `ts`
 and `py`, independently of extractor `formats`. Index also accepts `follow`.
 Search never changes persisted scan policy: `hidden`, `noIgnore`, `ignoreFiles`,
