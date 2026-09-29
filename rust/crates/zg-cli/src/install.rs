@@ -612,7 +612,7 @@ fn install_codex(options: &AgentOptions) -> Result<(), InstallError> {
         &config,
         CONFIG_START,
         CONFIG_END,
-        &codex_block(options),
+        &codex_block(options)?,
         options.force,
         Some(codex_conflict),
         Some(remove_codex_conflict),
@@ -1243,16 +1243,13 @@ fn stdio_command(toolset: Option<McpToolset>) -> Vec<&'static str> {
     command
 }
 
-fn codex_block(options: &AgentOptions) -> String {
+fn codex_block(options: &AgentOptions) -> Result<String, InstallError> {
     let connection = match options.transport {
         McpInstallTransport::Stdio => format!(
             "command = \"zg\"\nargs = {}",
             toml_string_array(&stdio_args(options.toolset))
         ),
-        McpInstallTransport::Http => format!(
-            "url = \"{}\"",
-            resolve_server_url().unwrap_or_else(|_| "http://127.0.0.1:7999/mcp".to_owned())
-        ),
+        McpInstallTransport::Http => format!("url = \"{}\"", resolve_server_url()?),
     };
     let token = options
         .token_env
@@ -1260,10 +1257,10 @@ fn codex_block(options: &AgentOptions) -> String {
         .map_or_else(String::new, |token| {
             format!("bearer_token_env_var = \"{token}\"\n")
         });
-    format!(
+    Ok(format!(
         "{CONFIG_START}\n[mcp_servers.zvec_grep]\n{connection}\n{token}tool_timeout_sec = {}\ndefault_tools_approval_mode = \"approve\"\n{CONFIG_END}",
         options.timeout_seconds
-    )
+    ))
 }
 
 fn toml_string_array(values: &[&str]) -> String {

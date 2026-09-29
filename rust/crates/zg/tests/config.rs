@@ -202,7 +202,7 @@ fn server_on_uses_global_listen_address_unless_overridden() {
 }
 
 #[test]
-fn server_on_uses_global_ipv6_host_when_available() {
+fn server_on_uses_bracketed_global_ipv6_host_when_available() {
     let Ok(listener) = TcpListener::bind("[::1]:0") else {
         return;
     };
@@ -213,7 +213,7 @@ fn server_on_uses_global_ipv6_host_when_available() {
     let _cleanup = ServerCleanup(&fixture);
     fixture.write_config(&json!({
         "version": 1,
-        "server": {"host": "::1", "port": port}
+        "server": {"host": "[::1]", "port": port}
     }));
     let started = fixture.success(&["--server", "on"]);
     assert!(

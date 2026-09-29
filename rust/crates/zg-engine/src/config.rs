@@ -57,7 +57,11 @@ fn server_url_from_config(config: &Value) -> Result<String, EngineError> {
 
 fn listen_from_config(config: &Value) -> Result<String, EngineError> {
     let host = string(config, &["server", "host"]).unwrap_or_else(|| "127.0.0.1".to_owned());
-    let normalized = host.to_ascii_lowercase();
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(&host);
+    let normalized = unbracketed.to_ascii_lowercase();
     if !matches!(normalized.as_str(), "127.0.0.1" | "::1" | "localhost") {
         return Err(EngineError::invalid_argument(
             "Server listen host must be loopback",
@@ -66,7 +70,7 @@ fn listen_from_config(config: &Value) -> Result<String, EngineError> {
     let host = if normalized == "localhost" {
         &normalized
     } else {
-        &host
+        unbracketed
     };
     let port = config["server"]["port"].as_u64().unwrap_or(7999);
     if host.contains(':') {
@@ -759,6 +763,18 @@ mod tests {
                 .expect("IPv6 config");
         assert_eq!(
             server_url_from_config(&ipv6).expect("url"),
+            "http://[::1]:8123/mcp"
+        );
+
+        let bracketed =
+            parse_global_config(&json!({"version": 1, "server": {"host": "[::1]", "port": 8123}}))
+                .expect("bracketed IPv6 config");
+        assert_eq!(
+            listen_from_config(&bracketed).expect("bracketed listen"),
+            "[::1]:8123"
+        );
+        assert_eq!(
+            server_url_from_config(&bracketed).expect("bracketed URL"),
             "http://[::1]:8123/mcp"
         );
 
