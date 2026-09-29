@@ -34,6 +34,8 @@ const VSCODE_FRONTMATTER: &str = "---\napplyTo: '**'\n---\n";
 pub enum InstallError {
     #[error("{0}")]
     Message(String),
+    #[error(transparent)]
+    Config(#[from] zg_engine::EngineError),
     #[error("installer I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("installer JSON failed: {0}")]
@@ -1854,37 +1856,7 @@ pub fn resolve_server_url() -> Result<String, InstallError> {
     if let Some(url) = non_empty_env("ZVEC_GREP_SERVER_URL") {
         return Ok(url);
     }
-    let path = home_dir().join(".zvec-grep/config.json");
-    let source = read_if_exists(&path)?;
-    if !source.trim().is_empty() {
-        let root = parse_json_object(&path, &source)?;
-        if let Some(url) = root
-            .get("client")
-            .and_then(Value::as_object)
-            .and_then(|client| client.get("serverUrl"))
-            .and_then(Value::as_str)
-        {
-            return Ok(url.to_owned());
-        }
-        let server = root.get("server").and_then(Value::as_object);
-        let host = server
-            .and_then(|value| value.get("host"))
-            .and_then(Value::as_str)
-            .unwrap_or("127.0.0.1");
-        let port = server
-            .and_then(|value| value.get("port"))
-            .and_then(Value::as_u64)
-            .unwrap_or(7999);
-        return Ok(format!(
-            "http://{}:{port}/mcp",
-            if host.contains(':') {
-                format!("[{host}]")
-            } else {
-                host.to_owned()
-            }
-        ));
-    }
-    Ok("http://127.0.0.1:7999/mcp".to_owned())
+    Ok(zg_engine::config::configured_server_url()?)
 }
 
 /// Resolves the loopback listen address used when install starts the daemon.
@@ -1893,29 +1865,7 @@ pub fn resolve_server_url() -> Result<String, InstallError> {
 ///
 /// Returns an error when the global configuration cannot be read or parsed.
 pub fn resolve_server_listen() -> Result<String, InstallError> {
-    let path = home_dir().join(".zvec-grep/config.json");
-    let source = read_if_exists(&path)?;
-    if source.trim().is_empty() {
-        return Ok("127.0.0.1:7999".to_owned());
-    }
-    let root = parse_json_object(&path, &source)?;
-    let server = root.get("server").and_then(Value::as_object);
-    let host = server
-        .and_then(|value| value.get("host"))
-        .and_then(Value::as_str)
-        .unwrap_or("127.0.0.1");
-    let port = server
-        .and_then(|value| value.get("port"))
-        .and_then(Value::as_u64)
-        .unwrap_or(7999);
-    Ok(format!(
-        "{}:{port}",
-        if host.contains(':') {
-            format!("[{host}]")
-        } else {
-            host.to_owned()
-        }
-    ))
+    Ok(zg_engine::config::server_listen()?)
 }
 
 fn context_warning(path: &Path, file_name: &str) -> Result<Option<String>, InstallError> {
