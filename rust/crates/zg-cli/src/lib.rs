@@ -1184,8 +1184,8 @@ fn context_refresh_policy(
     }
 }
 
-fn validate_query(args: &QueryArgs) -> Result<(), CliError> {
-    if args.force_direct && args.mode != Some(ClientMode::Direct) {
+fn validate_query(args: &QueryArgs, mode: ClientMode) -> Result<(), CliError> {
+    if args.force_direct && mode != ClientMode::Direct {
         return Err(CliError::ForceDirectMode);
     }
     if args.rg
@@ -1236,8 +1236,8 @@ fn query_plan(
     current_dir: PathBuf,
     terminal: bool,
 ) -> Result<CliPlan, CliError> {
-    validate_query(&args)?;
     let mode = resolve_query_mode(&args)?;
+    validate_query(&args, mode)?;
     let home = args.home.clone();
     let human = terminal && !args.compact;
     let output = OutputOptions {

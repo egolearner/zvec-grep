@@ -157,6 +157,59 @@ fn client_mode_uses_cli_then_environment_then_global_config() {
 }
 
 #[test]
+fn force_direct_uses_resolved_environment_mode() {
+    let fixture = Fixture::new();
+    fixture.write_config(&json!({"version": 1, "client": {"mode": "server"}}));
+
+    let direct = fixture
+        .command(&["--force-direct", "--json", "needle"])
+        .env("ZVEC_GREP_MODE", "direct")
+        .output()
+        .expect("environment direct mode");
+    assert!(!direct.status.success());
+    assert!(
+        String::from_utf8_lossy(&direct.stderr).contains("--json is not supported"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+
+    let server = fixture
+        .command(&["--force-direct", "--json", "needle"])
+        .env("ZVEC_GREP_MODE", "server")
+        .output()
+        .expect("environment server mode");
+    assert!(!server.status.success());
+    assert!(
+        String::from_utf8_lossy(&server.stderr).contains("--force-direct requires --mode direct"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&server.stderr)
+    );
+}
+
+#[test]
+fn force_direct_uses_resolved_global_mode() {
+    let fixture = Fixture::new();
+    fixture.write_config(&json!({"version": 1, "client": {"mode": "direct"}}));
+
+    let direct = fixture.run(&["--force-direct", "--json", "needle"]);
+    assert!(!direct.status.success());
+    assert!(
+        String::from_utf8_lossy(&direct.stderr).contains("--json is not supported"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+
+    fixture.write_config(&json!({"version": 1, "client": {"mode": "server"}}));
+    let server = fixture.run(&["--force-direct", "--json", "needle"]);
+    assert!(!server.status.success());
+    assert!(
+        String::from_utf8_lossy(&server.stderr).contains("--force-direct requires --mode direct"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&server.stderr)
+    );
+}
+
+#[test]
 fn server_on_uses_global_listen_address_unless_overridden() {
     let fixture = Fixture::new();
     let _cleanup = ServerCleanup(&fixture);
