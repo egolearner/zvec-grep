@@ -53,8 +53,11 @@ Matching local concurrency configurations share runtime admission. Different
 configurations use separate cached native resources; active leases keep their
 models alive, while unused variants are released when switching configurations.
 Transformers initialization errors remain terminal and cached until that runtime
-is replaced or the process restarts. GPU inference failures drain active calls
-before one shared CPU replacement, and each failed batch retries once. llama.cpp
+is replaced or the process restarts. Transformers `--device auto` selects only
+accelerators included in the build; portable Linux builds without CUDA select
+CPU. Explicit GPU requests still surface unsupported or failed initialization.
+GPU inference failures drain active calls before one shared CPU replacement, and
+each failed batch retries once. llama.cpp
 retains initialization fallback but does not retry inference failures on CPU.
 Catchable GPU failures suggest `--device cpu`; document failures also suggest
 `--index-embedding-concurrency 1`. Native process crashes cannot be recovered by

@@ -1,6 +1,48 @@
 use super::*;
 
 #[test]
+fn auto_device_skips_accelerators_missing_from_this_build() {
+    for (preferred, compiled) in [
+        (TransformersExecutionProvider::Cuda, cfg!(feature = "cuda")),
+        (
+            TransformersExecutionProvider::WebGpu,
+            cfg!(feature = "vulkan"),
+        ),
+        (
+            TransformersExecutionProvider::DirectMl,
+            cfg!(target_os = "windows"),
+        ),
+    ] {
+        let expected = if compiled {
+            preferred
+        } else {
+            TransformersExecutionProvider::Cpu
+        };
+        assert_eq!(
+            auto_execution_provider(preferred),
+            expected,
+            "{preferred:?}"
+        );
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "cuda")))]
+    assert_eq!(
+        resolve_execution_provider(Some(Device::Auto)),
+        TransformersExecutionProvider::Cpu,
+        "portable Linux builds must run Auto inference without CUDA"
+    );
+    assert_eq!(
+        resolve_execution_provider(Some(Device::Cuda)),
+        TransformersExecutionProvider::Cuda,
+        "explicit CUDA requests must still surface initialization failures"
+    );
+    assert_eq!(
+        resolve_execution_provider(Some(Device::Vulkan)),
+        TransformersExecutionProvider::WebGpu,
+        "explicit Vulkan requests must still surface initialization failures"
+    );
+}
+
+#[test]
 fn maps_devices_to_native_rust_execution_providers() {
     assert_eq!(
         resolve_execution_provider(None),

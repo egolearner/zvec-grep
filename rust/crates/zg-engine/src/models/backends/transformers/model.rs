@@ -665,12 +665,32 @@ fn resolve_execution_provider(device: Option<Device>) -> TransformersExecutionPr
         // ORT's CPU/MLAS path is both faster and substantially smaller than
         // CoreML for the catalog's quantized ONNX model on Apple Silicon.
         Some(Device::Auto) if cfg!(target_os = "windows") => {
-            TransformersExecutionProvider::DirectMl
+            auto_execution_provider(TransformersExecutionProvider::DirectMl)
         }
         Some(Device::Auto) if cfg!(all(target_os = "linux", target_arch = "x86_64")) => {
-            TransformersExecutionProvider::Cuda
+            auto_execution_provider(TransformersExecutionProvider::Cuda)
         }
-        Some(Device::Vulkan | Device::Auto) => TransformersExecutionProvider::WebGpu,
+        Some(Device::Vulkan) => TransformersExecutionProvider::WebGpu,
+        Some(Device::Auto) => auto_execution_provider(TransformersExecutionProvider::WebGpu),
+    }
+}
+
+fn auto_execution_provider(
+    preferred: TransformersExecutionProvider,
+) -> TransformersExecutionProvider {
+    // Auto selection only considers compiled accelerators. Once selected,
+    // initialization errors remain terminal, as they do for explicit devices.
+    match preferred {
+        TransformersExecutionProvider::Cuda if !cfg!(feature = "cuda") => {
+            TransformersExecutionProvider::Cpu
+        }
+        TransformersExecutionProvider::WebGpu if !cfg!(feature = "vulkan") => {
+            TransformersExecutionProvider::Cpu
+        }
+        TransformersExecutionProvider::DirectMl if !cfg!(target_os = "windows") => {
+            TransformersExecutionProvider::Cpu
+        }
+        _ => preferred,
     }
 }
 
