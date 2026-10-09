@@ -16,7 +16,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use super::compute::ModelComputeRuntime;
-use super::concurrency::{batch_concurrency, is_llama, local_runtime_limit};
+use super::concurrency::{batch_concurrency, local_runtime_limit};
 use crate::domain::{
     Content,
     model::{Device, EmbeddingModelInfo, EmbeddingResult, ModelConfig},
@@ -128,7 +128,6 @@ pub(crate) struct ModelRuntimeLease {
 struct OperationConcurrency {
     limit: usize,
     permits: Arc<Semaphore>,
-    automatic: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -209,7 +208,7 @@ impl ModelRuntimeManager {
                 runtime: Arc::new(ModelRuntime {
                     model,
                     active_embeddings: AtomicUsize::new(0),
-                    batch_permits: (key.local_limit.is_some() || is_llama(&reference)).then(|| {
+                    batch_permits: key.local_limit.is_some().then(|| {
                         Arc::new(Semaphore::new(
                             batch_concurrency(&reference, key.local_limit).unwrap_or(1),
                         ))
@@ -237,7 +236,6 @@ impl ModelRuntimeManager {
             // Preserve the requested budget without overflowing Tokio's permit counter.
             Arc::new(Semaphore::new(concurrency.min(Semaphore::MAX_PERMITS)))
         });
-        let automatic = is_llama(&reference) && key.local_limit.is_none();
         let lease = ModelRuntimeLease {
             key,
             entry,
@@ -245,7 +243,6 @@ impl ModelRuntimeManager {
             operation: Arc::new(OperationConcurrency {
                 limit: concurrency,
                 permits,
-                automatic,
             }),
         };
         drop(state);
@@ -439,13 +436,11 @@ impl ModelRuntimeLease {
     ) -> Result<(), ModelError> {
         if let Some(reporter) = progress {
             let model_progress = options.on_progress.take();
-            let operation = Arc::clone(&self.operation);
-            let model = Arc::clone(&self.entry.runtime.model);
+            let concurrency = self.operation.limit;
             options.on_progress = Some(Arc::new(move |progress| {
                 if let Some(model_progress) = &model_progress {
                     model_progress(progress.clone());
                 }
-                let concurrency = operation.execution_limit(model.concurrency_defaults());
                 reporter.report(progress, concurrency);
             }));
         }
@@ -462,23 +457,15 @@ impl ModelRuntimeLease {
             .acquire_operation_permit(options.signal.as_ref())
             .await?;
         let _active = ActiveEmbeddingGuard::new(&self.entry.runtime.active_embeddings);
-        options.execution_concurrency = if self.operation.automatic {
-            0 // The backend resolves GPU capacity only after its lazy load.
-        } else {
-            self.operation.limit
-        };
+        options.execution_concurrency = self.operation.limit;
         if let Some(reporter) = progress {
             let model_progress = options.on_progress.take();
             let operation = Arc::clone(&self.operation);
-            let model = Arc::clone(&self.entry.runtime.model);
             options.on_progress = Some(Arc::new(move |progress| {
                 if let Some(model_progress) = &model_progress {
                     model_progress(progress.clone());
                 }
-                reporter.report(
-                    progress,
-                    operation.execution_limit(model.concurrency_defaults()),
-                );
+                reporter.report(progress, operation.limit);
             }));
         }
         self.entry.runtime.model.embed(inputs, options).await
@@ -568,24 +555,14 @@ impl ModelRuntimeKey {
             endpoint: options.endpoint.clone(),
             model_cache_dir: options.cache_dir.clone(),
             device: options.device,
-            local_limit: local_runtime_limit(reference, None, options.device),
+            local_limit: local_runtime_limit(reference, None),
         }
     }
 
     fn for_request(reference: &str, options: &ModelConfig, concurrency: Option<usize>) -> Self {
         let mut key = Self::new(reference, options);
-        key.local_limit = local_runtime_limit(reference, concurrency, options.device);
+        key.local_limit = local_runtime_limit(reference, concurrency);
         key
-    }
-}
-
-impl OperationConcurrency {
-    fn execution_limit(&self, defaults: EmbeddingConcurrencyDefaults) -> usize {
-        if self.automatic {
-            defaults.initial.max(1)
-        } else {
-            self.limit
-        }
     }
 }
 

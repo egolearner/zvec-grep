@@ -54,8 +54,7 @@ pub struct EmbeddingOptions {
     pub on_progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
     /// Runtime-owned execution budget. Backends use this to size their
     /// per-request local inference resources without exposing another public
-    /// tuning knob. Zero asks a lazy backend to resolve its automatic budget
-    /// after loading; explicit native budgets are capped by the runtime.
+    /// tuning knob.
     pub(crate) execution_concurrency: usize,
     /// Standard W3C trace headers propagated by remote embedding backends.
     pub(crate) trace_headers: Option<EmbeddingTraceHeaders>,

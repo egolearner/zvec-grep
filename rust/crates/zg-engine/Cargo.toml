@@ -10,8 +10,8 @@ publish.workspace = true
 [features]
 default = []
 # CUDA and Vulkan require their native toolchains at build time. Platform
-# release builds enable the matching feature. llama.cpp warns and falls back
-# to CPU for unavailable accelerators; Transformers initialization stays terminal.
+# release builds enable the matching feature, while unsupported requests keep
+# the same warning-and-CPU-fallback behavior as main.
 cuda = ["llama-cpp-2/cuda", "ort/cuda"]
 vulkan = ["llama-cpp-2/vulkan", "ort/webgpu"]
 

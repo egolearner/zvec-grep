@@ -1,16 +1,5 @@
 use super::*;
 
-#[test]
-fn gpu_recovery_advice_keeps_index_options_out_of_query_failures() {
-    let document = gpu_recovery_hint(EmbeddingPurpose::Document);
-    assert!(document.contains("--index-embedding-concurrency 1"));
-    assert!(document.contains(INDEX_CONCURRENCY_ENV));
-    let query = gpu_recovery_hint(EmbeddingPurpose::Query);
-    assert!(query.contains("--device cpu"));
-    assert!(!query.contains(INDEX_CONCURRENCY_ENV));
-    assert!(!query.contains("--index-embedding-concurrency"));
-}
-
 fn resolve(
     reference: &str,
     requested: Option<usize>,
@@ -81,17 +70,14 @@ fn invalid_environment_warns_and_uses_auto_without_legacy_retry() {
 fn native_limits_cap_at_eight_and_llama_batches_are_serial() {
     let llama = "local/embeddinggemma-300m";
     let transformers = "local/all-minilm-l6-v2";
-    assert_eq!(
-        local_runtime_limit(llama, Some(24), Some(Device::Cuda)),
-        Some(8)
-    );
-    assert_eq!(local_runtime_limit(llama, None, Some(Device::Cpu)), Some(1));
-    assert_eq!(local_runtime_limit(llama, None, Some(Device::Cuda)), None);
-    assert_eq!(local_runtime_limit(transformers, Some(24), None), Some(8));
+    assert_eq!(local_runtime_limit(llama, Some(24)), Some(8));
+    assert_eq!(local_runtime_limit(llama, None), Some(1));
+    assert_eq!(local_runtime_limit(transformers, Some(24)), Some(8));
+    assert_eq!(local_runtime_limit(transformers, None), Some(1));
     assert_eq!(batch_concurrency(llama, Some(24)), Some(1));
     assert_eq!(batch_concurrency(transformers, Some(24)), Some(8));
     for reference in ["local/potion-code-16m-v2", "qwen/text-embedding-v4"] {
-        assert_eq!(local_runtime_limit(reference, Some(24), None), None);
+        assert_eq!(local_runtime_limit(reference, Some(24)), None);
         assert_eq!(batch_concurrency(reference, Some(24)), Some(24));
     }
 }

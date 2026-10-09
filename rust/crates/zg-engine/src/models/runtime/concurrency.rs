@@ -2,20 +2,11 @@
 
 use std::env;
 
-use crate::domain::model::{Device, EmbeddingPurpose};
 use crate::models::{EmbeddingCatalogEntry, ModelError, get_embedding_model_catalog_entry};
 
 pub(crate) const INDEX_CONCURRENCY_ENV: &str = "ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY";
 const LEGACY_LLAMA_ENV: &str = "ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM";
 pub(crate) const LOCAL_CONCURRENCY_CAP: usize = 8;
-
-pub(crate) fn gpu_recovery_hint(purpose: EmbeddingPurpose) -> String {
-    let mut hint = "For GPU errors, retry with --device cpu".to_owned();
-    if purpose == EmbeddingPurpose::Document {
-        hint.push_str(" or index with --index-embedding-concurrency 1 (environment fallback: ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY=1)");
-    }
-    hint
-}
 
 pub(crate) fn is_llama(reference: &str) -> bool {
     matches!(
@@ -83,17 +74,9 @@ fn resolve_override(
 }
 
 /// Local native resources must not be shared across different fixed budgets.
-pub(crate) fn local_runtime_limit(
-    reference: &str,
-    requested: Option<usize>,
-    device: Option<Device>,
-) -> Option<usize> {
-    if is_transformers(reference) {
+pub(crate) fn local_runtime_limit(reference: &str, requested: Option<usize>) -> Option<usize> {
+    if is_transformers(reference) || is_llama(reference) {
         Some(requested.unwrap_or(1).clamp(1, LOCAL_CONCURRENCY_CAP))
-    } else if is_llama(reference) {
-        requested
-            .map(|value| value.clamp(1, LOCAL_CONCURRENCY_CAP))
-            .or_else(|| matches!(device, None | Some(Device::Cpu)).then_some(1))
     } else {
         None
     }

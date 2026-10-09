@@ -62,19 +62,6 @@ fn context_pool_honors_user_limit_and_caps_at_eight() {
 }
 
 #[test]
-fn automatic_gpu_budget_keeps_the_existing_vram_heuristic() {
-    let mib = 1024 * 1024;
-    assert_eq!(automatic_gpu_concurrency(0, 0), 1);
-    assert_eq!(automatic_gpu_concurrency(0, 16 * 1024 * mib), 1);
-    assert_eq!(automatic_gpu_concurrency(1200 * mib, 16 * 1024 * mib), 2);
-    assert_eq!(
-        automatic_gpu_concurrency(8 * 1024 * mib, 16 * 1024 * mib),
-        8
-    );
-    assert_eq!(automatic_gpu_concurrency(100, 1), 2);
-}
-
-#[test]
 fn context_batch_capacity_tracks_tokens_instead_of_full_context() {
     assert_eq!(llama_batch_capacity(7, 2_048).expect("capacity"), 32);
     assert_eq!(llama_batch_capacity(65, 2_048).expect("capacity"), 128);

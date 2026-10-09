@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::{EngineError, ErrorSite};
 
-#[derive(Clone, Debug, Error)]
+#[derive(Debug, Error)]
 #[error("{message}")]
 pub struct ModelError {
     code: &'static str,

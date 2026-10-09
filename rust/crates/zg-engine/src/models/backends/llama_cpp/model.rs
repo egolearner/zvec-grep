@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, PoisonError,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
@@ -51,14 +51,13 @@ pub(crate) struct LlamaCppEmbeddingModel {
     compute_runtime: ModelComputeRuntime,
     client: reqwest::Client,
     state: Mutex<Option<Arc<LoadedLlamaModel>>>,
-    automatic_concurrency: AtomicUsize,
 }
 
 struct LoadedLlamaModel {
     contexts: LlamaContextPool,
     model: Arc<LlamaModel>,
+    model_path: PathBuf,
     gpu: bool,
-    automatic_concurrency: usize,
 }
 
 struct LlamaContextPool {
@@ -148,7 +147,6 @@ impl LlamaCppEmbeddingModel {
             compute_runtime,
             client: reqwest::Client::new(),
             state: Mutex::new(None),
-            automatic_concurrency: AtomicUsize::new(1),
         }
     }
 
@@ -217,23 +215,41 @@ impl LlamaCppEmbeddingModel {
             .compute_runtime
             .run(move || load_model_with_fallback(&path, device, &reporter_for_load))
             .await??;
-        self.automatic_concurrency
-            .store(model.automatic_concurrency, Ordering::Release);
         reporter.finish();
         Ok(model)
+    }
+
+    async fn fallback_to_cpu(
+        &self,
+        failed: Arc<LoadedLlamaModel>,
+        on_progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
+        cause: &ModelError,
+    ) -> Result<Arc<LoadedLlamaModel>, ModelError> {
+        let mut state = self.state.lock().await;
+        if let Some(current) = &*state
+            && !Arc::ptr_eq(current, &failed)
+        {
+            return Ok(Arc::clone(current));
+        }
+        let warning =
+            format!("llama.cpp GPU embedding context failed ({cause}), falling back to CPU.");
+        report_warning(self.entry.reference, on_progress.as_ref(), warning);
+        let path = failed.model_path.clone();
+        let previous = state.take();
+        drop(previous);
+        drop(failed);
+        let loaded = Arc::new(
+            self.compute_runtime
+                .run(move || load_cpu_model(&path))
+                .await??,
+        );
+        *state = Some(Arc::clone(&loaded));
+        Ok(loaded)
     }
 }
 
 #[async_trait]
 impl EmbeddingModel for LlamaCppEmbeddingModel {
-    fn concurrency_defaults(&self) -> crate::models::spi::EmbeddingConcurrencyDefaults {
-        let limit = self.automatic_concurrency.load(Ordering::Acquire);
-        crate::models::spi::EmbeddingConcurrencyDefaults {
-            initial: limit,
-            maximum: limit,
-        }
-    }
-
     fn info(&self) -> &EmbeddingModelInfo {
         &self.info
     }
@@ -253,6 +269,7 @@ impl EmbeddingModel for LlamaCppEmbeddingModel {
         validate_inputs(&self.info, inputs, |content| {
             matches!(content, Content::Text(_))
         })?;
+        let on_progress = options.on_progress.clone();
         let model = self
             .ensure_loaded(options.on_progress, options.signal.as_ref())
             .await
@@ -264,11 +281,7 @@ impl EmbeddingModel for LlamaCppEmbeddingModel {
             .collect::<Result<Vec<_>, ModelError>>()?;
         let entry = self.entry;
         let signal = options.signal;
-        let execution_concurrency = if options.execution_concurrency == 0 {
-            self.automatic_concurrency.load(Ordering::Acquire)
-        } else {
-            options.execution_concurrency
-        };
+        let execution_concurrency = options.execution_concurrency.max(1);
         let loaded = Arc::clone(&model);
         let texts_for_first_attempt = texts.clone();
         let signal_for_first_attempt = signal.clone();
@@ -284,19 +297,22 @@ impl EmbeddingModel for LlamaCppEmbeddingModel {
                 )
             })
             .await?;
-        // The context pool has drained every worker before returning this error.
-        // GPU inference failures remain visible; initialization owns CPU fallback.
-        let result = first.map_err(|error| {
-            let error = embed_error(entry, error);
-            if model.gpu && error.code() != crate::EngineError::CANCELLED {
-                error.wrap(
-                    "llama.cpp GPU inference failed",
-                    Some(crate::models::runtime::gpu_recovery_hint(purpose)),
-                )
-            } else {
-                error
+        let result = match first {
+            Ok(result) => result,
+            Err(error) if model.gpu => {
+                let cpu = self
+                    .fallback_to_cpu(model, on_progress, &error)
+                    .await
+                    .map_err(|fallback| embed_error(entry, fallback))?;
+                self.compute_runtime
+                    .run(move || {
+                        embed_texts(&cpu, &texts, entry, execution_concurrency, signal.as_ref())
+                    })
+                    .await?
+                    .map_err(|error| embed_error(entry, error))?
             }
-        })?;
+            Err(error) => return Err(embed_error(entry, error)),
+        };
         validate_result(&self.info, inputs.len(), &result)?;
         Ok(result)
     }
@@ -312,13 +328,7 @@ fn load_model_with_fallback(
     if wants_gpu {
         if let Some(selected) = select_gpu_device(device) {
             match load_gpu_model(path, selected.index) {
-                Ok(mut model) => {
-                    // Query after loading so the model weights are already reflected in free VRAM.
-                    model.automatic_concurrency = select_gpu_device(device).map_or(1, |memory| {
-                        automatic_gpu_concurrency(memory.memory_free, memory.memory_total)
-                    });
-                    return Ok(model);
-                }
+                Ok(model) => return Ok(model),
                 Err(error) => {
                     let warning =
                         format!("llama.cpp GPU model load failed ({error}), falling back to CPU.");
@@ -349,7 +359,7 @@ fn load_gpu_model(path: &Path, device_index: usize) -> Result<LoadedLlamaModel, 
         })?
         .with_n_gpu_layers(u32::MAX);
     LlamaModel::load_from_file(llama_backend()?, path, &params)
-        .map(|model| loaded_llama_model(model, true))
+        .map(|model| loaded_llama_model(model, path, true))
         .map_err(|error| {
             ModelError::storage_failure("Unable to load llama.cpp GPU embedding model")
                 .with_cause(error)
@@ -359,19 +369,19 @@ fn load_gpu_model(path: &Path, device_index: usize) -> Result<LoadedLlamaModel, 
 fn load_cpu_model(path: &Path) -> Result<LoadedLlamaModel, ModelError> {
     let params = LlamaModelParams::default().with_n_gpu_layers(0);
     LlamaModel::load_from_file(llama_backend()?, path, &params)
-        .map(|model| loaded_llama_model(model, false))
+        .map(|model| loaded_llama_model(model, path, false))
         .map_err(|error| {
             ModelError::storage_failure("Unable to load llama.cpp embedding model")
                 .with_cause(error)
         })
 }
 
-fn loaded_llama_model(model: LlamaModel, gpu: bool) -> LoadedLlamaModel {
+fn loaded_llama_model(model: LlamaModel, path: &Path, gpu: bool) -> LoadedLlamaModel {
     let model = Arc::new(model);
     LoadedLlamaModel {
         contexts: LlamaContextPool::new(Arc::clone(&model)),
         model,
-        automatic_concurrency: 1,
+        model_path: path.to_path_buf(),
         gpu,
     }
 }
@@ -410,6 +420,21 @@ const fn requested_device_name(device: Option<Device>) -> &'static str {
         Some(Device::Vulkan) => "vulkan",
         Some(Device::Cuda) => "cuda",
         None | Some(Device::Cpu) => "cpu",
+    }
+}
+
+fn report_warning(
+    model: &str,
+    on_progress: Option<&Arc<dyn Fn(ModelProgress) + Send + Sync>>,
+    message: String,
+) {
+    if let Some(on_progress) = on_progress {
+        on_progress(ModelProgress::Warning {
+            model: model.to_owned(),
+            message,
+        });
+    } else {
+        tracing::warn!("{message}");
     }
 }
 
@@ -476,17 +501,6 @@ fn physical_context_worker_limit(_gpu: bool, requested: usize) -> usize {
     requested.clamp(1, crate::models::runtime::LOCAL_CONCURRENCY_CAP)
 }
 
-fn automatic_gpu_concurrency(free: usize, total: usize) -> usize {
-    // An unavailable VRAM query uses one context; an inconsistent query uses two.
-    if total == 0 {
-        return 1;
-    }
-    if free > total {
-        return 2;
-    }
-    (free / 4 / (150 * 1024 * 1024)).clamp(1, crate::models::runtime::LOCAL_CONCURRENCY_CAP)
-}
-
 impl LlamaContextPool {
     fn new(model: Arc<LlamaModel>) -> Self {
         Self {
@@ -515,23 +529,17 @@ impl LlamaContextPool {
             chunks[offset % worker_count].push(input);
         }
 
-        // Validate all jobs before dispatch so no early error can skip draining workers.
-        let capacities = chunks
-            .iter()
-            .map(|chunk| {
-                llama_batch_capacity(
-                    chunk
-                        .iter()
-                        .map(|input| input.tokens.len())
-                        .max()
-                        .unwrap_or(1),
-                    context_size,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let mut pending = Vec::with_capacity(worker_count);
         let mut first_error = None;
-        for ((worker, chunk), batch_capacity) in workers.into_iter().zip(chunks).zip(capacities) {
+        for (worker, chunk) in workers.into_iter().zip(chunks) {
+            let batch_capacity = llama_batch_capacity(
+                chunk
+                    .iter()
+                    .map(|input| input.tokens.len())
+                    .max()
+                    .unwrap_or(1),
+                context_size,
+            )?;
             let (response, receiver) = mpsc::sync_channel(1);
             let job = LlamaWorkerJob {
                 inputs: chunk,
