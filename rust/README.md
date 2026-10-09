@@ -27,6 +27,39 @@ let reply = zg.context(ContextOptions {
 zg.close();
 ```
 
+Index embedding concurrency is configured with
+`zg --index --index-embedding-concurrency <n>`; the old
+`--embedding-concurrency` spelling is rejected. For automatic indexing and
+refreshes as well, set `ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY=<n>`. Values must be
+positive integers. Explicit CLI/API index settings take precedence over this
+environment variable, followed by the legacy
+`ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM` for llama.cpp indexing, then backend defaults.
+Invalid environment values warn and select the automatic default. These overrides
+do not configure query-vector inference and are not persisted in workspace settings.
+Direct and Server indexing use the same engine boundary; restart the Server after
+changing its inherited environment, while explicit CLI overrides need no restart.
+
+For llama.cpp, the limit controls contexts within a serialized batch and is capped
+at eight. Automatic GPU selection retains the `clamp(floor(freeVRAM * 0.25 /
+150 MiB), 1, 8)` heuristic; CPU or unavailable VRAM information uses one context,
+and inconsistent VRAM information uses two. This is a heuristic, not a memory-fit
+guarantee. Transformers/ORT limits in-flight batches to at most eight, defaulting
+to one. Unlike the Node pipeline, ORT may create sessions within this budget;
+CoreML retains one physical session. Potion/model2vec defaults to two batch tasks
+and retains an independent CPU worker capacity; remote models retain adaptive
+request scheduling. Model2vec and remote overrides are not capped at eight.
+
+Matching local concurrency configurations share runtime admission. Different
+configurations use separate cached native resources; active leases keep their
+models alive, while unused variants are released when switching configurations.
+Transformers initialization errors remain terminal and cached until that runtime
+is replaced or the process restarts. GPU inference failures drain active calls
+before one shared CPU replacement, and each failed batch retries once. llama.cpp
+retains initialization fallback but does not retry inference failures on CPU.
+Catchable GPU failures suggest `--device cpu`; document failures also suggest
+`--index-embedding-concurrency 1`. Native process crashes cannot be recovered by
+these error handlers.
+
 `zg --install --target opencode` respects a nonempty `OPENCODE_CONFIG` override.
 Otherwise it selects an existing `opencode.jsonc` before `opencode.json` under
 `${XDG_CONFIG_HOME:-~/.config}/opencode`, creating `opencode.json` when neither

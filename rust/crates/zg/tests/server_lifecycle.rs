@@ -137,6 +137,10 @@ fn start_server(
     start_on_available_port(binary, home, token_file, |listen| {
         let mut command = Command::new(binary);
         command
+            .env(
+                "ZVEC_GREP_WORKSPACE_REGISTRY",
+                home.path().join("workspaces.json"),
+            )
             .args(["--server", "on", "--home"])
             .arg(home.path())
             .args(["--listen", listen, "--mcp-toolset", toolset]);
@@ -235,6 +239,7 @@ impl StdioBridge {
                 .map_or(0, |metadata| metadata.len());
         let mut command = Command::new(binary);
         command.env_remove("ZVEC_GREP_MCP_TOOLSET");
+        command.env("ZVEC_GREP_WORKSPACE_REGISTRY", home.join("workspaces.json"));
         command.args([
             "--server",
             "--stdio",
@@ -1607,7 +1612,7 @@ impl EmbeddingServer {
             assert!(
                 Instant::now() < deadline,
                 "watcher did not submit the edited file: {stage}\n{}",
-                log_tail(&home.join("daemon/server.log"), 0)
+                log_tail(&home.join("daemon").join("logs").join("server.log"), 0)
             );
             std::thread::sleep(Duration::from_millis(10));
         }

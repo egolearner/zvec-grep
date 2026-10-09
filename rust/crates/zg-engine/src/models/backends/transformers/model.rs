@@ -1,3 +1,4 @@
+use super::inference_gate::InferenceGate;
 use crate::domain::Content;
 use std::{
     collections::{HashMap, VecDeque},
@@ -49,7 +50,7 @@ pub(crate) struct TransformersEmbeddingModel {
     device: Option<Device>,
     compute_runtime: ModelComputeRuntime,
     client: reqwest::Client,
-    state: Mutex<Option<Arc<LoadedTransformersModel>>>,
+    state: Mutex<Option<Result<Arc<LoadedTransformersModel>, ModelError>>>,
 }
 
 struct LoadedTransformersModel {
@@ -63,6 +64,8 @@ struct SessionPool {
     state: StdMutex<SessionPoolState>,
     changed: Condvar,
     fallback: StdMutex<()>,
+    // Replacement waits for every GPU inference and session creation to finish.
+    inference: InferenceGate,
     coreml_batcher: CoreMlBatcher,
 }
 
@@ -71,6 +74,7 @@ struct SessionPoolState {
     generation: u64,
     creating: usize,
     sessions: Vec<Arc<SessionSlot>>,
+    failure: Option<ModelError>,
 }
 
 struct SessionSlot {
@@ -155,12 +159,20 @@ impl TransformersEmbeddingModel {
         signal: Option<&CancellationToken>,
     ) -> Result<Arc<LoadedTransformersModel>, ModelError> {
         let mut state = self.state.lock().await;
-        if let Some(loaded) = &*state {
-            return Ok(Arc::clone(loaded));
+        if let Some(result) = &*state {
+            return result.clone();
         }
-        let loaded = Arc::new(self.load(on_progress, signal).await?);
-        *state = Some(Arc::clone(&loaded));
-        Ok(loaded)
+        let result = self.load(on_progress, signal).await.map(Arc::new).map_err(|error| {
+            error.wrap(
+                "Transformers initialization failed; check model files and runtime configuration, then restart the process or daemon",
+                Some(format!("model={}", self.entry.reference)),
+            ).shared()
+        });
+        // Cancellation belongs to this caller; it must not poison a cached model.
+        if !matches!(&result, Err(error) if error.code() == crate::EngineError::CANCELLED) {
+            *state = Some(result.clone());
+        }
+        result
     }
 
     async fn load(
@@ -309,6 +321,7 @@ impl EmbeddingModel for TransformersEmbeddingModel {
                 })
             })
             .collect::<Result<Vec<_>, ModelError>>()?;
+        let gpu = loaded.sessions.provider() != TransformersExecutionProvider::Cpu;
         let tokenizer = loaded.tokenizer.clone();
         let entry = self.entry;
         let signal = options.signal;
@@ -327,7 +340,17 @@ impl EmbeddingModel for TransformersEmbeddingModel {
                     on_progress.as_ref(),
                 )
             })
-            .await??;
+            .await?
+            .map_err(|error| {
+                if gpu && error.code() != crate::EngineError::CANCELLED {
+                    error.wrap(
+                        "Transformers GPU inference failed",
+                        Some(crate::models::runtime::gpu_recovery_hint(purpose)),
+                    )
+                } else {
+                    error
+                }
+            })?;
         validate_result(&self.info, inputs.len(), &result)?;
         Ok(result)
     }
@@ -350,39 +373,15 @@ impl SessionPool {
                 tracing::warn!("{warning}");
             }
         }
-        let (session, provider) = if requested == TransformersExecutionProvider::Cpu {
-            (
-                load_session(&model_path, requested, &prepacked_weights)?,
-                TransformersExecutionProvider::Cpu,
-            )
-        } else {
-            match load_session(&model_path, requested, &prepacked_weights) {
-                Ok(session) => (session, requested),
-                Err(error) => {
-                    let warning = format!(
-                        "Transformers {} embedding initialization failed ({}), falling back to CPU.",
-                        requested.name(),
-                        error
-                    );
-                    if !reporter.warning(warning.clone()) {
-                        tracing::warn!("{warning}");
-                    }
-                    (
-                        load_session(
-                            &model_path,
-                            TransformersExecutionProvider::Cpu,
-                            &prepacked_weights,
-                        )?,
-                        TransformersExecutionProvider::Cpu,
-                    )
-                }
-            }
-        };
+        // Initialization failures are terminal; only inference may retry on CPU.
+        let session = load_session(&model_path, requested, &prepacked_weights)?;
+        let provider = requested;
         Ok(Self {
             model_path,
             prepacked_weights,
             state: StdMutex::new(SessionPoolState {
                 provider,
+                failure: None,
                 generation: 0,
                 creating: 0,
                 sessions: vec![Arc::new(SessionSlot {
@@ -392,6 +391,7 @@ impl SessionPool {
             }),
             changed: Condvar::new(),
             fallback: StdMutex::new(()),
+            inference: InferenceGate::default(),
             coreml_batcher: CoreMlBatcher::default(),
         })
     }
@@ -401,9 +401,13 @@ impl SessionPool {
         max_sessions: usize,
         inference: impl Fn(&mut Session) -> Result<T, ModelError>,
     ) -> Result<T, ModelError> {
-        let max_sessions = max_sessions.max(1);
+        let _inference = self.inference.enter();
+        let max_sessions = max_sessions.clamp(1, crate::models::runtime::LOCAL_CONCURRENCY_CAP);
         loop {
             let mut state = lock_std_mutex(&self.state);
+            if let Some(error) = &state.failure {
+                return Err(error.clone());
+            }
             if let Some(slot) = state.sessions.iter().find_map(|slot| {
                 slot.busy
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -588,15 +592,32 @@ impl SessionPool {
 
     fn fallback_to_cpu(&self) -> Result<bool, ModelError> {
         let _fallback = lock_std_mutex(&self.fallback);
-        if self.provider() == TransformersExecutionProvider::Cpu {
+        let _inference = self.inference.replace();
+        let mut state = lock_std_mutex(&self.state);
+        if let Some(error) = &state.failure {
+            return Err(error.clone());
+        }
+        if state.provider == TransformersExecutionProvider::Cpu {
             return Ok(false);
         }
-        let session = load_session(
+        let retired = std::mem::take(&mut state.sessions);
+        drop(state);
+        drop(retired);
+        let replacement = load_session(
             &self.model_path,
             TransformersExecutionProvider::Cpu,
             &self.prepacked_weights,
-        )?;
+        );
         let mut state = lock_std_mutex(&self.state);
+        let session = match replacement {
+            Ok(session) => session,
+            Err(error) => {
+                let error = error.shared();
+                state.failure = Some(error.clone());
+                self.changed.notify_all();
+                return Err(error);
+            }
+        };
         state.provider = TransformersExecutionProvider::Cpu;
         state.generation = state.generation.wrapping_add(1);
         state.sessions = vec![Arc::new(SessionSlot {
@@ -801,7 +822,10 @@ fn embed_batch(
     };
     match first {
         Ok(result) => Ok(result),
-        Err(error) if provider != TransformersExecutionProvider::Cpu => {
+        Err(error)
+            if provider != TransformersExecutionProvider::Cpu
+                && error.code() != crate::EngineError::CANCELLED =>
+        {
             let warning = format!(
                 "Transformers {} embedding inference failed ({}), falling back to CPU.",
                 provider.name(),
@@ -815,13 +839,25 @@ fn embed_batch(
             } else {
                 tracing::warn!("{warning}");
             }
-            loaded.sessions.fallback_to_cpu()?;
-            loaded.sessions.run(execution_concurrency, |session| {
-                run_session(session, &prepared, entry, signal)
-            })
+            loaded.sessions.fallback_to_cpu().map_err(|fallback| {
+                gpu_recovery_error(fallback, "Transformers CPU replacement failed", &error)
+            })?;
+            loaded
+                .sessions
+                .run(execution_concurrency, |session| {
+                    run_session(session, &prepared, entry, signal)
+                })
+                .map_err(|retry| gpu_recovery_error(retry, "Transformers CPU retry failed", &error))
         }
         Err(error) => Err(error),
     }
+}
+
+fn gpu_recovery_error(failure: ModelError, message: &str, gpu_failure: &ModelError) -> ModelError {
+    failure.wrap(
+        message,
+        Some(gpu_failure.clone().into_engine_error().to_string()),
+    )
 }
 
 fn merge_prepared_batches(batches: &[&PreparedBatch]) -> Result<PreparedBatch, ModelError> {

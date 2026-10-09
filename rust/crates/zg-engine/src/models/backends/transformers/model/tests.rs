@@ -179,6 +179,83 @@ async fn cancelled_initial_load_preserves_cancellation_code() {
         .expect_err("cancelled load");
 
     assert_eq!(error.code(), crate::EngineError::CANCELLED);
+    assert!(
+        model.state.lock().await.is_none(),
+        "cancellation must not poison initialization"
+    );
+}
+
+#[tokio::test]
+async fn initialization_failure_is_shared_and_cached_without_cpu_retry() {
+    let cache = tempfile::tempdir().expect("model cache");
+    let mut config = entry("mean", true);
+    config.dtype = "invalid-dtype";
+    let mut model = TransformersEmbeddingModel::new(
+        config,
+        ModelConfig {
+            cache_dir: Some(cache.path().to_owned()),
+            device: Some(Device::Cuda),
+            ..ModelConfig::default()
+        },
+        ModelComputeRuntime::shared(),
+    );
+    let (first, second) = tokio::join!(
+        model.ensure_loaded(None, None),
+        model.ensure_loaded(None, None)
+    );
+    let first = first.err().expect("terminal initialization error");
+    let second = second.err().expect("shared terminal error");
+    assert_eq!(first.code(), second.code());
+    assert_eq!(first.cause(), second.cause());
+    assert!(first.should_fail_fast());
+    assert!(
+        model
+            .state
+            .lock()
+            .await
+            .as_ref()
+            .expect("cached failure")
+            .is_err()
+    );
+    // A later caller must observe the original failure without attempting another load.
+    model.entry.dtype = "q8";
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let later = model
+        .ensure_loaded(None, Some(&cancelled))
+        .await
+        .err()
+        .expect("cached failure");
+    assert_eq!(later.code(), first.code());
+    assert_eq!(later.cause(), first.cause());
+}
+
+#[test]
+fn recovery_failures_preserve_native_gpu_and_cpu_causes_and_failure_scope() {
+    let gpu = ModelError::internal("GPU inference failed")
+        .with_cause("device memory exhausted")
+        .wrap("ONNX execution failed", Some("provider=cuda".into()));
+    for message in [
+        "Transformers CPU replacement failed",
+        "Transformers CPU retry failed",
+    ] {
+        let failure = gpu_recovery_error(
+            ModelError::storage_failure("CPU execution failed").with_cause("native runtime error"),
+            message,
+            &gpu,
+        );
+        assert_eq!(failure.code(), crate::EngineError::STORAGE_FAILURE);
+        assert!(failure.should_fail_fast());
+        let rendered = failure.into_engine_error().to_string();
+        for expected in [
+            message,
+            "provider=cuda",
+            "device memory exhausted",
+            "native runtime error",
+        ] {
+            assert!(rendered.contains(expected), "{rendered}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -347,6 +424,7 @@ async fn cached_minilm_routes_metal_to_cpu_with_warning() {
     let loaded = model.state.lock().await;
     let provider = loaded
         .as_ref()
+        .and_then(|loaded| loaded.as_ref().ok())
         .map(|loaded| loaded.sessions.provider())
         .expect("loaded model");
     assert_eq!(provider, TransformersExecutionProvider::Cpu);

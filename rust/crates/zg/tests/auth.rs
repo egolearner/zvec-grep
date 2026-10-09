@@ -23,6 +23,10 @@ impl Fixture {
                 self.state.path().join("key"),
             )
             .env("ZVEC_GREP_HOME", self.state.path())
+            .env(
+                "ZVEC_GREP_WORKSPACE_REGISTRY",
+                self.state.path().join("workspaces.json"),
+            )
             .env_remove("ZVEC_GREP_EMBEDDING")
             .env_remove("ZVEC_GREP_ENDPOINT")
             .env_remove("ZVEC_GREP_API_KEY")
