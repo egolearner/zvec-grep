@@ -1956,16 +1956,13 @@ mod tests {
             .await
             .expect("watch change should be delivered");
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if executor
-                    .calls
-                    .lock()
-                    .expect("calls should be readable")
-                    .len()
-                    == 2
-                {
-                    break;
-                }
+            while executor
+                .calls
+                .lock()
+                .expect("calls should be readable")
+                .len()
+                < 2
+            {
                 tokio::task::yield_now().await;
             }
         })
@@ -1991,16 +1988,13 @@ mod tests {
             .await
             .expect("reconcile should be delivered");
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if executor
-                    .calls
-                    .lock()
-                    .expect("calls should be readable")
-                    .len()
-                    == 3
-                {
-                    break;
-                }
+            while executor
+                .calls
+                .lock()
+                .expect("calls should be readable")
+                .len()
+                < 3
+            {
                 tokio::task::yield_now().await;
             }
         })
