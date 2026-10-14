@@ -603,7 +603,7 @@ mod tests {
                 symbol_type: Some(SymbolType::Function),
                 symbol_name: Some("fetch".to_owned()),
                 scope: Some("Service".to_owned()),
-                signature: Some("@staticmethod\nasync def fetch(value: str) -> str:".to_owned()),
+                signature: Some("async def fetch(value: str) -> str:".to_owned()),
                 documentation: None,
             }))
         );
@@ -652,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn signatures_preserve_python_decorators_and_their_arguments() {
+    fn signatures_exclude_python_decorators_and_their_arguments() {
         let source = test_source(
             FileFormat::Python,
             "signatures.py",
@@ -667,18 +667,26 @@ mod tests {
             .join("\n"),
         );
         let fragments = extract(&source, ChunkOptions::default()).expect("python extraction");
-        assert_eq!(
-            signature(&fragments, "Service"),
-            "@registered(name=\"Service  API\")\nclass Service:"
-        );
+        assert_eq!(signature(&fragments, "Service"), "class Service:");
         assert_eq!(
             signature(&fragments, "fetch"),
-            "@staticmethod\n@route(\"a  b\")\nasync def fetch(value: str) -> str:"
+            "async def fetch(value: str) -> str:"
         );
     }
 
     #[test]
-    fn signatures_preserve_rust_visibility_attributes_and_documentation() {
+    fn signatures_exclude_rust_diagnostic_messages() {
+        let source = test_source(
+            FileFormat::Rust,
+            "signatures.rs",
+            "#[diagnostic::on_unimplemented(note = \"consider adding Serialize to your type\")]\npub trait Serialize {}",
+        );
+        let fragments = extract(&source, ChunkOptions::default()).expect("rust extraction");
+        assert_eq!(signature(&fragments, "Serialize"), "pub trait Serialize");
+    }
+
+    #[test]
+    fn signatures_exclude_rust_attributes_and_preserve_visibility_and_documentation() {
         let source = test_source(
             FileFormat::Rust,
             "signatures.rs",
@@ -695,7 +703,7 @@ mod tests {
         let fragments = extract(&source, ChunkOptions::default()).expect("rust extraction");
         assert_eq!(
             signature(&fragments, "load"),
-            "#[must_use = \"use  the result\"]\n#[inline]\npub(crate) async unsafe fn load(value: usize) -> usize"
+            "pub(crate) async unsafe fn load(value: usize) -> usize"
         );
         assert_eq!(signature(&fragments, "plain"), "pub fn plain()");
         assert!(matches!(
@@ -703,6 +711,124 @@ mod tests {
             Some(EntityMetadata::Code(CodeMetadata { documentation: Some(doc), .. }))
                 if doc == "Load a value.\nKeep the result."
         ));
+    }
+
+    #[test]
+    fn signatures_exclude_prose_across_languages() {
+        let fixtures = [
+            (
+                FileFormat::Rust,
+                "fixture.rs",
+                r##"#[cfg_attr(feature = "std", deprecated(note = r#"use another type ] )"#))]
+#[doc = "A human-readable type description."]
+pub trait Serialize<T /* prose */>: Sized
+where T: Send {
+    #[must_use = "remember this type"]
+    fn serialize(#[allow(unused, reason = "unused type")] value: T) -> Result<(), Error>;
+}"##,
+                &[
+                    ("Serialize", "pub trait Serialize<T >: Sized where T: Send"),
+                    ("serialize", "fn serialize( value: T) -> Result<(), Error>"),
+                ][..],
+            ),
+            (
+                FileFormat::TypeScript,
+                "fixture.ts",
+                r#"export /* exported prose */ default class Service {
+    @deprecated("use another type")
+    load: (value: string) => Result;
+}
+export /* export prose */ const read /* binding prose */ = (value: Input /* parameter prose */): Output => value;
+interface Options {
+    /** Top-level prose. */
+    config?: {
+        /** Nested type prose. */
+        mode: "fast" | "safe";
+    };
+}"#,
+                &[
+                    ("Service", "export default class Service"),
+                    ("load", "load: (value: string) => Result"),
+                    ("read", "export const read = (value: Input ): Output =>"),
+                    ("config", "config?: { mode: \"fast\" | \"safe\"; }"),
+                ],
+            ),
+            (
+                FileFormat::JavaScript,
+                "fixture.js",
+                "export /* export prose */ function read(value /* parameter prose */) { return value; }",
+                &[("read", "export function read(value )")],
+            ),
+            (
+                FileFormat::Java,
+                "Fixture.java",
+                r#"@Deprecated(since = "use another type")
+public class Service {
+    @SuppressWarnings("human type description")
+    public String read(@Named("parameter prose") String value /* comment prose */) { return value; }
+}"#,
+                &[
+                    ("Service", "public class Service"),
+                    ("read", "public String read( String value )"),
+                ],
+            ),
+            (
+                FileFormat::Cpp,
+                "fixture.cpp",
+                r#"[[deprecated("use another type")]] int read(int value /* prose */) { return value; }"#,
+                &[("read", "int read(int value )")],
+            ),
+            (
+                FileFormat::C,
+                "fixture.c",
+                "__attribute__((deprecated(\"use another type\"))) int/**/read(int value) { return value; }",
+                &[("read", "int read(int value)")],
+            ),
+            (
+                FileFormat::Go,
+                "fixture.go",
+                "package demo\nfunc read(value /* prose */ string) string { return value }",
+                &[("read", "func read(value string) string")],
+            ),
+            (
+                FileFormat::Python,
+                "fixture.py",
+                "@deprecated(\"use another type\")\ndef read(\n    value: str, # parameter prose\n) -> str:\n    return value",
+                &[("read", "def read( value: str, ) -> str:")],
+            ),
+        ];
+        for (format, path, text, expected) in fixtures {
+            let source = test_source(format, path, text);
+            let entities = extract_for_indexing(&source, ChunkOptions::default())
+                .expect("code extraction for indexing");
+            for &(name, expected_signature) in expected {
+                let entity = named(&entities, name);
+                assert_source_backed(&source, entity);
+                assert_eq!(
+                    signature(&entities, name)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    expected_signature,
+                    "{format:?}: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn signatures_preserve_literals_that_look_like_comments_or_attributes() {
+        let source = test_source(
+            FileFormat::TypeScript,
+            "literals.ts",
+            r##"export function read(value: "/*type*/" | "//type" = "//type", marker = "#[type]  @type") { return value; }"##,
+        );
+        let entities =
+            extract_for_indexing(&source, ChunkOptions::default()).expect("typescript extraction");
+        assert_eq!(
+            signature(&entities, "read"),
+            r##"export function read(value: "/*type*/" | "//type" = "//type", marker = "#[type]  @type")"##
+        );
     }
 
     #[test]

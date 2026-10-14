@@ -311,30 +311,7 @@ impl LanguageAdapter {
             }
             AdapterKind::Python => {
                 let definition = inner_python_definition(node).unwrap_or(node);
-                let signature = extract_generic_signature(definition, source)?;
-                let mut lines = named_children(node)
-                    .into_iter()
-                    .filter(|child| child.kind() == "decorator")
-                    .map(|decorator| text(decorator, source).trim().to_owned())
-                    .collect::<Vec<_>>();
-                lines.push(signature);
-                Some(lines.join("\n"))
-            }
-            AdapterKind::Rust => {
-                let signature = extract_generic_signature(node, source)?;
-                let mut attributes = Vec::new();
-                let mut sibling = node.prev_named_sibling();
-                while let Some(item) = sibling {
-                    match item.kind() {
-                        "attribute_item" => attributes.push(text(item, source).trim().to_owned()),
-                        "line_comment" | "block_comment" => {}
-                        _ => break,
-                    }
-                    sibling = item.prev_named_sibling();
-                }
-                attributes.reverse();
-                attributes.push(signature);
-                Some(attributes.join("\n"))
+                extract_generic_signature(definition, source)
             }
             _ => extract_generic_signature(node, source),
         }
@@ -676,7 +653,7 @@ fn extract_javascript_signature(node: Node<'_>, source: &[u8]) -> Option<String>
             "arrow_function" | "function_expression" | "generator_function"
         )
     }) {
-        let prefix = std::str::from_utf8(&source[node.start_byte()..value.start_byte()]).ok()?;
+        let prefix = extract_signature_prefix(node, source, value.start_byte());
         format!(
             "{} {}",
             prefix.trim(),
@@ -703,8 +680,7 @@ fn extract_javascript_signature(node: Node<'_>, source: &[u8]) -> Option<String>
         .parent()
         .filter(|parent| matches!(parent.kind(), "ambient_declaration" | "export_statement"))
     {
-        let prefix =
-            std::str::from_utf8(&source[wrapper.start_byte()..declaration.start_byte()]).ok()?;
+        let prefix = extract_signature_prefix(wrapper, source, declaration.start_byte());
         signature = format!("{} {signature}", prefix.trim());
         declaration = wrapper;
     }
@@ -713,13 +689,44 @@ fn extract_javascript_signature(node: Node<'_>, source: &[u8]) -> Option<String>
 
 fn extract_generic_signature(node: Node<'_>, source: &[u8]) -> Option<String> {
     let mut raw = String::new();
-    append_signature(node, source, false, &mut raw);
+    append_signature(node, source, node.end_byte(), false, &mut raw);
     let signature = raw.trim().trim_end_matches(['{', ';']).trim();
     (!signature.is_empty()).then(|| signature.to_owned())
 }
 
+fn extract_signature_prefix(node: Node<'_>, source: &[u8], end_byte: usize) -> String {
+    let mut prefix = String::new();
+    append_signature(node, source, end_byte, false, &mut prefix);
+    prefix
+}
+
 // Empty nested bodies preserve declaration suffixes, such as a C typedef's alias.
-fn append_signature(node: Node<'_>, source: &[u8], nested: bool, out: &mut String) {
+fn append_signature(
+    node: Node<'_>,
+    source: &[u8],
+    end_byte: usize,
+    nested: bool,
+    out: &mut String,
+) {
+    // Exclude prose-bearing syntax by node kind, preserving literal types and defaults.
+    if matches!(
+        node.kind(),
+        "comment"
+            | "line_comment"
+            | "block_comment"
+            | "documentation_comment"
+            | "attribute_item"
+            | "inner_attribute_item"
+            | "attribute_specifier"
+            | "attribute_declaration"
+            | "annotation"
+            | "marker_annotation"
+            | "decorator"
+    ) {
+        // A comment may be the only separator between two declaration tokens.
+        out.push(' ');
+        return;
+    }
     let body = node.child_by_field_name("body").or_else(|| {
         named_children(node).into_iter().find(|child| {
             matches!(
@@ -735,6 +742,9 @@ fn append_signature(node: Node<'_>, source: &[u8], nested: bool, out: &mut Strin
     });
     let mut offset = node.start_byte();
     for child in named_children(node) {
+        if child.start_byte() >= end_byte {
+            break;
+        }
         out.push_str(std::str::from_utf8(&source[offset..child.start_byte()]).unwrap_or_default());
         if Some(child) == body {
             if !nested {
@@ -750,11 +760,11 @@ fn append_signature(node: Node<'_>, source: &[u8], nested: bool, out: &mut Strin
         {
             out.push_str("{}");
         } else {
-            append_signature(child, source, true, out);
+            append_signature(child, source, child.end_byte(), true, out);
         }
         offset = child.end_byte();
     }
-    out.push_str(std::str::from_utf8(&source[offset..node.end_byte()]).unwrap_or_default());
+    out.push_str(std::str::from_utf8(&source[offset..end_byte]).unwrap_or_default());
 }
 
 fn extract_preceding_doc(node: Node<'_>, source: &[u8]) -> Option<String> {
