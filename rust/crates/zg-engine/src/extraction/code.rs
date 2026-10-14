@@ -157,7 +157,7 @@ fn walk_code_node<'tree>(
                     symbol_type: adapter.classify(entity),
                     breadcrumb: entity_breadcrumb,
                     signature: adapter.extract_signature(entity, source),
-                    documentation: LanguageAdapter::extract_doc(entity, source),
+                    documentation: adapter.extract_doc(entity, source),
                 });
             }
         }
@@ -711,6 +711,241 @@ mod tests {
             Some(EntityMetadata::Code(CodeMetadata { documentation: Some(doc), .. }))
                 if doc == "Load a value.\nKeep the result."
         ));
+    }
+
+    #[test]
+    fn documentation_preserves_rust_doc_attributes_in_source_order() {
+        let source = test_source(
+            FileFormat::Rust,
+            "docs.rs",
+            r###"/// First paragraph.
+#[doc = "Searchable\n\"quoted\" \x74ext \u{4E2D}\\path"]
+#[diagnostic::on_unimplemented(note = "diagnostic_only")]
+#[doc = r##"Raw // text with "quotes" and #[markers]."##]
+/** Last paragraph. */
+pub trait Documented {}
+#[doc(hidden)]
+#[deprecated(note = "deprecated_only")]
+pub fn undocumented() {}"###,
+        );
+        let entities = extract_for_indexing(&source, ChunkOptions::default()).expect("extraction");
+        let entity = named(&entities, "Documented");
+        assert_source_backed(&source, entity);
+        let Some(EntityMetadata::Code(metadata)) = test_metadata(entity) else {
+            panic!("code metadata expected");
+        };
+        assert_eq!(
+            metadata.documentation.as_deref(),
+            Some(
+                "First paragraph.\nSearchable\n\"quoted\" text 中\\path\nRaw // text with \"quotes\" and #[markers].\nLast paragraph."
+            )
+        );
+        assert_eq!(metadata.signature.as_deref(), Some("pub trait Documented"));
+        assert!(matches!(
+            test_metadata(named(&entities, "undocumented")),
+            Some(EntityMetadata::Code(CodeMetadata {
+                documentation: None,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn documentation_follows_declaration_wrappers() {
+        let fixtures = [
+            (
+                FileFormat::JavaScript,
+                "docs.js",
+                "/** Searchable documentation. */\nexport function read() {}",
+                "read",
+            ),
+            (
+                FileFormat::JavaScript,
+                "docs.js",
+                "/** Searchable documentation. */\nexport const read = () => {};",
+                "read",
+            ),
+            (
+                FileFormat::TypeScript,
+                "docs.ts",
+                "/** Searchable documentation. */\nexport declare function read(): void;",
+                "read",
+            ),
+            (
+                FileFormat::TypeScript,
+                "docs.ts",
+                "/** Searchable documentation. */\nexport default class Service {}",
+                "Service",
+            ),
+            (
+                FileFormat::Go,
+                "docs.go",
+                "package demo\n// Searchable documentation.\ntype Service struct {}",
+                "Service",
+            ),
+            (
+                FileFormat::C,
+                "docs.c",
+                "/** Searchable documentation. */\nstruct Service {};",
+                "Service",
+            ),
+            (
+                FileFormat::Cpp,
+                "docs.cpp",
+                "/** Searchable documentation. */\nclass Service {};",
+                "Service",
+            ),
+            (
+                FileFormat::Java,
+                "Docs.java",
+                "/** Searchable documentation. */\n@Deprecated\nclass Service {}",
+                "Service",
+            ),
+            (
+                FileFormat::Python,
+                "docs.py",
+                "# Searchable documentation.\n@registered\nclass Service:\n    pass",
+                "Service",
+            ),
+        ];
+        let mut missing = Vec::new();
+        for (format, path, text, name) in fixtures {
+            let source = test_source(format, path, text);
+            let entities =
+                extract_for_indexing(&source, ChunkOptions::default()).expect("extraction");
+            let entity = named(&entities, name);
+            assert_source_backed(&source, entity);
+            let Some(EntityMetadata::Code(metadata)) = test_metadata(entity) else {
+                panic!("code metadata expected");
+            };
+            if metadata.documentation.as_deref() != Some("Searchable documentation.") {
+                missing.push((format, text, metadata.documentation.clone()));
+            }
+            assert!(
+                !metadata
+                    .signature
+                    .as_deref()
+                    .expect("signature")
+                    .contains("Searchable")
+            );
+        }
+        assert!(missing.is_empty(), "missing documentation: {missing:#?}");
+    }
+
+    #[test]
+    fn documentation_keeps_rust_inner_docs_on_their_owner() {
+        let source = test_source(
+            FileFormat::Rust,
+            "docs.rs",
+            "//! Crate documentation.\n#![doc = \"Crate details.\"]\n/// Module summary.\npub mod service {\n    //! Inner module summary.\n    #![doc = \"Additional module details.\"]\n    /*! Final module details. */\n    pub fn undocumented() {}\n}",
+        );
+        let entities = extract_for_indexing(&source, ChunkOptions::default()).expect("extraction");
+        assert!(matches!(
+            test_metadata(named(&entities, "service")),
+            Some(EntityMetadata::Code(CodeMetadata { documentation: Some(doc), .. }))
+                if doc == "Crate documentation.\nCrate details.\nModule summary.\nInner module summary.\nAdditional module details.\nFinal module details."
+        ));
+        assert!(matches!(
+            test_metadata(named(&entities, "undocumented")),
+            Some(EntityMetadata::Code(CodeMetadata {
+                documentation: None,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn documentation_decodes_rust_strings_without_interpreting_other_attributes() {
+        let fixtures = [
+            (
+                r#"#[ /* comment */ doc = r"literal \n text"]"#,
+                Some(r"literal \n text"),
+            ),
+            (
+                r#"#[doc = "first\tsecond\r\nthird\0end\'"]"#,
+                Some("first\tsecond\r\nthird\0end'"),
+            ),
+            ("#[doc = \"first\\\n    second\"]", Some("firstsecond")),
+            ("#[doc = \"first\\\r\n    second\"]", Some("firstsecond")),
+            (r#"#[doc = "\u{1F_600}"]"#, Some("😀")),
+            (r#"#[doc = "\xFF"]"#, None),
+            (r#"#[doc = "\u{D800}"]"#, None),
+            (r#"#[doc = "\q"]"#, None),
+            (r#"#[doc = include_str!("external.md")]"#, None),
+            (r#"#[tool::doc = "attribute_only"]"#, None),
+            (r#"#[other(doc = "attribute_only")]"#, None),
+            (r#"#[doc(alias = "attribute_only")]"#, None),
+        ];
+        for (attribute, expected) in fixtures {
+            let source = test_source(
+                FileFormat::Rust,
+                "docs.rs",
+                &format!("{attribute}\npub fn read() {{}}"),
+            );
+            let entities =
+                extract_for_indexing(&source, ChunkOptions::default()).expect("extraction");
+            let Some(EntityMetadata::Code(metadata)) = test_metadata(named(&entities, "read"))
+            else {
+                panic!("code metadata expected");
+            };
+            assert_eq!(metadata.documentation.as_deref(), expected, "{attribute}");
+            assert_eq!(metadata.signature.as_deref(), Some("pub fn read()"));
+        }
+    }
+
+    #[test]
+    fn documentation_does_not_cross_symbol_boundaries() {
+        let fixtures = [
+            (
+                FileFormat::TypeScript,
+                "docs.ts",
+                "/** Parent docs. */\nexport class Service { read() {} }\nexport function other() {}",
+                "Service",
+                "Parent docs.",
+                &["read", "other"][..],
+            ),
+            (
+                FileFormat::JavaScript,
+                "docs.js",
+                "/** Wrapper docs. */\nexport /* Local docs. */ function read() {}\nexport function other() {}",
+                "read",
+                "Wrapper docs.\nLocal docs.",
+                &["other"],
+            ),
+            (
+                FileFormat::Go,
+                "docs.go",
+                "package demo\n// Group docs.\ntype (\n// Local docs.\nService struct {}\n)\ntype Other struct {}",
+                "Service",
+                "Group docs.\nLocal docs.",
+                &["Other"],
+            ),
+        ];
+        for (format, path, text, name, expected, undocumented) in fixtures {
+            let source = test_source(format, path, text);
+            let entities =
+                extract_for_indexing(&source, ChunkOptions::default()).expect("extraction");
+            let Some(EntityMetadata::Code(metadata)) = test_metadata(named(&entities, name)) else {
+                panic!("code metadata expected");
+            };
+            assert_eq!(
+                metadata.documentation.as_deref(),
+                Some(expected),
+                "{format:?}"
+            );
+            for name in undocumented {
+                assert!(
+                    matches!(
+                        test_metadata(named(&entities, name)),
+                        Some(EntityMetadata::Code(CodeMetadata {
+                            documentation: None,
+                            ..
+                        }))
+                    ),
+                    "{format:?}: {name}"
+                );
+            }
+        }
     }
 
     #[test]
