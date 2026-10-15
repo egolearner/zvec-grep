@@ -16,6 +16,10 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[path = "support/terminal.rs"]
+mod terminal;
+
 struct Fixture {
     root: TempDir,
     user: TempDir,
@@ -463,6 +467,14 @@ async fn indexed_cli_queries_do_not_wait_for_incremental_writer() {
 #[test]
 fn direct_search_warns_about_unmatched_index_drift_on_stderr() {
     let fixture = Fixture::new();
+    fixture.success(&[
+        "--index",
+        "--mode",
+        "direct",
+        "--embedding",
+        "local/potion-code-16m-v2",
+        "--no-color",
+    ]);
     let clean = fixture.success(&["--mode", "direct", "--fts", "needle", "--no-color"]);
     assert!(!String::from_utf8_lossy(&clean.stderr).contains("status:"));
     fs::write(
@@ -484,20 +496,25 @@ fn direct_search_warns_about_unmatched_index_drift_on_stderr() {
 }
 
 #[test]
-fn missing_index_uses_default_local_model_without_polluting_query_stdout() {
+fn noninteractive_missing_index_requires_explicit_creation() {
     let fixture = Fixture::new();
-    // Empty workspaces and FTS-only queries never download or execute a model.
-    let output = fixture.success(&["--mode", "direct", "--fts", "needle", "--no-color"]);
+    // Missing workspaces never download or execute a model without confirmation.
+    let output = fixture
+        .command(&["--mode", "direct", "--fts", "needle", "--no-color"])
+        .output()
+        .expect("noninteractive query");
+    assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("No index found"), "{stderr}");
     assert!(
-        stderr.contains("No index found; creating one with local/potion-code-16m-v2."),
+        stderr.contains("zg --index --embedding <model>"),
         "{stderr}"
     );
-    assert!(stderr.contains("Index complete"), "{stderr}");
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "No matches.\n");
-    fixture.assert_model("direct", "local/potion-code-16m-v2");
+    assert!(output.stdout.is_empty());
+    assert!(!fixture.root.path().join(".zvec-grep").exists());
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn configured_local_models_follow_environment_then_global_default_precedence() {
     for (configured, environment, expected) in [
@@ -534,16 +551,14 @@ fn configured_local_models_follow_environment_then_global_default_precedence() {
         if let Some(reference) = environment {
             command.env("ZVEC_GREP_EMBEDDING", reference);
         }
-        let output = success(command.output().expect("configured query"));
+        let output = success(terminal::run(command, &[("Enter Build", b"\r")]));
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(&format!("No index found; creating one with {expected}.")),
-            "{stderr}"
-        );
+        assert!(stderr.contains("Select an embedding model:"), "{stderr}");
         fixture.assert_model("direct", expected);
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn auto_and_server_build_at_the_query_root_not_the_daemon_working_directory() {
     for (mode, server, expected) in [
@@ -562,13 +577,10 @@ fn auto_and_server_build_at_the_query_root_not_the_daemon_working_directory() {
             // Query-process defaults must take precedence over the daemon's environment.
             command.env("ZVEC_GREP_EMBEDDING", expected);
         }
-        let output = success(command.output().expect("query"));
+        let output = success(terminal::run(command, &[("Enter Build", b"\r")]));
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(&format!("No index found; creating one with {expected}.")),
-            "{stderr}"
-        );
-        assert!(stderr.contains("Index complete"), "{stderr}");
+        assert!(stderr.contains("Select an embedding model:"), "{stderr}");
+        assert!(stderr.contains("Index ready"), "{stderr}");
         assert_eq!(String::from_utf8_lossy(&output.stdout), "No matches.\n");
         let status = success(
             fixture
@@ -620,7 +632,7 @@ fn disabled_workspace_is_not_rebuilt_from_a_nested_query_directory() {
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!stderr.contains("No index found"), "{stderr}");
-        assert!(!stderr.contains("Index complete"), "{stderr}");
+        assert!(!stderr.contains("Index ready"), "{stderr}");
         let status = fixture.success(&["--status", "--mode", mode, "--no-color"]);
         let stdout = String::from_utf8_lossy(&status.stdout);
         assert!(
@@ -686,7 +698,7 @@ fn existing_local_and_remote_indexes_are_reused_from_nested_directories() {
             );
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(!stderr.contains("No index found"), "{stderr}");
-            assert!(!stderr.contains("Index complete"), "{stderr}");
+            assert!(!stderr.contains("Index ready"), "{stderr}");
             assert_eq!(String::from_utf8_lossy(&output.stdout), "No matches.\n");
             fixture.assert_model(mode, reference);
             assert!(!nested.join(".zvec-grep").exists());
@@ -694,6 +706,7 @@ fn existing_local_and_remote_indexes_are_reused_from_nested_directories() {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn implicit_build_preserves_local_overrides_without_persisting_remote_credentials() {
     for mode in ["direct", "server"] {
@@ -711,26 +724,26 @@ fn implicit_build_preserves_local_overrides_without_persisting_remote_credential
             fixture.start_server();
         }
         let cache = fixture.user.path().join("explicit-model-cache");
-        let output = success(
-            fixture
-                .command(&[
-                    "--mode",
-                    mode,
-                    "--fts",
-                    "needle",
-                    "--device",
-                    "cpu",
-                    "--api-key",
-                    "implicit-query-secret",
-                    "--allow-remote",
-                    "--no-color",
-                    "--model-cache",
-                ])
-                .arg(&cache)
-                .env("ZVEC_GREP_ENDPOINT", "https://example.invalid/override")
-                .output()
-                .expect("query with runtime overrides"),
-        );
+        let mut command = fixture.command(&[
+            "--mode",
+            mode,
+            "--fts",
+            "needle",
+            "--device",
+            "cpu",
+            "--api-key",
+            "implicit-query-secret",
+            "--allow-remote",
+            "--no-color",
+            "--model-cache",
+        ]);
+        command
+            .arg(&cache)
+            .env("ZVEC_GREP_ENDPOINT", "https://example.invalid/override");
+        let output = success(terminal::run(
+            command,
+            &[("Enter Continue", b"\x1b[D"), ("Enter Build", b"\r")],
+        ));
         fixture.assert_model(mode, "local/potion-code-16m-v2");
         let manifest: serde_json::Value = serde_json::from_slice(
             &fs::read(fixture.root.path().join(".zvec-grep/manifest.json")).expect("manifest"),
@@ -746,4 +759,167 @@ fn implicit_build_preserves_local_overrides_without_persisting_remote_credential
         assert!(!String::from_utf8_lossy(&output.stdout).contains("implicit-query-secret"));
         assert!(!String::from_utf8_lossy(&output.stderr).contains("implicit-query-secret"));
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn escaping_model_selection_leaves_no_index_or_downloads() {
+    let fixture = Fixture::new();
+    let output = terminal::run(
+        fixture.command(&["--mode", "direct", "--fts", "needle", "--no-color"]),
+        &[("Esc Exit", b"\x1b")],
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!fixture.root.path().join(".zvec-grep").exists());
+    assert!(!fixture.user.path().join("models").exists());
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn remote_authorization_can_return_to_model_selection_without_sending_data() {
+    let fixture = Fixture::new();
+    fixture.success(&[
+        "--config",
+        "model",
+        "set",
+        "qwen/text-embedding-v4",
+        "--default",
+        "--endpoint",
+        "http://127.0.0.1:1/no-requests",
+    ]);
+    let output = success(terminal::run(
+        fixture.command(&[
+            "--mode",
+            "direct",
+            "--fts",
+            "needle",
+            "--api-key",
+            "setup-test-secret",
+            "--no-color",
+        ]),
+        &[
+            ("Enter Continue", b"\r"),
+            ("Back to model selection", b"\x1b[B\x1b[B\r"),
+            ("Enter Continue", b"\x1b[D"),
+            ("Enter Build", b"\r"),
+        ],
+    ));
+    fixture.assert_model("direct", "local/potion-code-16m-v2");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("setup-test-secret"));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "No matches.\n");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn remote_allow_once_covers_the_cli_build_and_following_query_without_a_grant() {
+    for mode in ["direct", "server"] {
+        let mut fixture = Fixture::new();
+        fixture.success(&[
+            "--config",
+            "model",
+            "set",
+            "qwen/text-embedding-v4",
+            "--default",
+            "--endpoint",
+            "http://127.0.0.1:1/no-requests",
+        ]);
+        if mode == "server" {
+            fixture.start_server();
+        }
+        let output = success(terminal::run(
+            fixture.command(&[
+                "--mode",
+                mode,
+                "--fts",
+                "needle",
+                "--api-key",
+                "setup-test-secret",
+                "--no-color",
+            ]),
+            &[("Enter Continue", b"\r"), ("Enter Confirm", b"\r")],
+        ));
+        fixture.assert_model(mode, "qwen/text-embedding-v4");
+        assert!(
+            !fixture
+                .root
+                .path()
+                .join(".zvec-grep/authorization.json")
+                .exists()
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "No matches.\n");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("setup-test-secret"));
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn escaping_remote_authorization_leaves_no_index_or_grant() {
+    let fixture = Fixture::new();
+    fixture.success(&[
+        "--config",
+        "model",
+        "set",
+        "qwen/text-embedding-v4",
+        "--default",
+        "--endpoint",
+        "http://127.0.0.1:1/no-requests",
+    ]);
+    let output = terminal::run(
+        fixture.command(&[
+            "--mode",
+            "direct",
+            "--fts",
+            "needle",
+            "--api-key",
+            "setup-test-secret",
+            "--no-color",
+        ]),
+        &[("Enter Continue", b"\r"), ("Enter Confirm", b"\x1b")],
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!fixture.root.path().join(".zvec-grep").exists());
+    assert!(!fixture.user.path().join("models").exists());
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn matching_workspace_consent_skips_the_remote_authorization_screen() {
+    let fixture = Fixture::new();
+    fixture.success(&[
+        "--config",
+        "model",
+        "set",
+        "qwen/text-embedding-v4",
+        "--default",
+        "--endpoint",
+        "http://127.0.0.1:1/no-requests",
+    ]);
+    fixture.success(&[
+        "--auth",
+        "grant",
+        fixture.root.path().to_str().expect("root"),
+        "--capability",
+        "embedding",
+        "--scope",
+        "workspace",
+        "--embedding",
+        "qwen/text-embedding-v4",
+    ]);
+    let output = success(terminal::run(
+        fixture.command(&[
+            "--mode",
+            "direct",
+            "--fts",
+            "needle",
+            "--api-key",
+            "setup-test-secret",
+            "--no-color",
+        ]),
+        &[("Enter Continue", b"\r")],
+    ));
+    fixture.assert_model("direct", "qwen/text-embedding-v4");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("Remote embedding authorization"));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "No matches.\n");
 }
