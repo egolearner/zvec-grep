@@ -456,6 +456,23 @@ async fn select_query_index(
         let Some(model) = selection.select(root, color)? else {
             return Err(EngineError::cancelled("Index creation cancelled").into());
         };
+        if !model.available()
+            && request
+                .api_key
+                .as_ref()
+                .is_none_or(|key| key.trim().is_empty())
+        {
+            let Some(api_key) = zg_cli::prompt_setup_credential(&model.reference, color)? else {
+                return Err(EngineError::cancelled(
+                    "Index creation cancelled; no API Key was saved",
+                )
+                .into());
+            };
+            let provider = model.reference.split('/').next().unwrap_or_default();
+            zg_engine::config::set_provider(provider, &api_key)?;
+            selection.set_provider_credential_available(provider);
+            request.api_key = Some(api_key);
+        }
         let mut index_request = IndexOptions {
             root: Some(root.to_path_buf()),
             embedding: Some(EmbeddingModelSpec {

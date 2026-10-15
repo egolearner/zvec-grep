@@ -155,8 +155,11 @@ model before building. The picker has **Local models** and **Remote models** tab
 downloaded local models and globally configured remote models appear first.
 Use ↑/↓ to select, ←/→ or Tab to switch, Enter to confirm and Esc to exit.
 Each tab keeps its selection when switching. A valid model preference selects the
-initial tab; without one the picker opens Local models. Missing remote credentials
-are shown in the list and cannot be selected.
+initial tab; without one the picker opens Local models. Remote models show whether
+credentials are available. Selecting one with missing credentials opens a masked
+API Key prompt, with paste, Backspace, Ctrl+U to clear and Esc to exit. Enter saves
+a non-empty key to the provider's global configuration and continues to remote
+authorization. The new key is used for both the build and following CLI query.
 
 Local selection starts the build. Remote selection first discloses the workspace,
 model, endpoint, data sent and possible API charges, then offers Allow once, Allow
@@ -172,6 +175,7 @@ with `zg --index --embedding <model>` first. Empty workspaces do not download mo
 
 On MCP connections with background scheduling and form elicitation, missing-index
 searches ask the user to select a model and authorize remote use when needed.
+MCP model choices require credentials to be configured beforehand.
 Acceptance submits a background build and returns its job ID immediately; retry
 search after completion. Allow once covers that background build only. Later search
 requests report current build progress without repeating model selection. Unsupported

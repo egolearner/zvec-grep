@@ -2,7 +2,10 @@ use std::{
     fs,
     net::TcpListener,
     process::{Command, Output, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -201,11 +204,16 @@ struct GatedEmbedding {
     endpoint: String,
     entered: Arc<Semaphore>,
     release: Arc<Semaphore>,
+    authorized_requests: Arc<AtomicUsize>,
     server: JoinHandle<()>,
 }
 
 impl GatedEmbedding {
     async fn start() -> Self {
+        Self::start_with_credential(None).await
+    }
+
+    async fn start_with_credential(expected_key: Option<String>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("fake embedding listener");
@@ -215,9 +223,11 @@ impl GatedEmbedding {
         );
         let entered = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
+        let authorized_requests = Arc::new(AtomicUsize::new(0));
         let server = tokio::spawn({
             let entered = Arc::clone(&entered);
             let release = Arc::clone(&release);
+            let authorized_requests = Arc::clone(&authorized_requests);
             async move {
                 let mut handlers = JoinSet::new();
                 loop {
@@ -226,8 +236,10 @@ impl GatedEmbedding {
                             let (stream, _) = connection.expect("embedding connection");
                             let entered = Arc::clone(&entered);
                             let release = Arc::clone(&release);
+                            let expected_key = expected_key.clone();
+                            let authorized_requests = Arc::clone(&authorized_requests);
                             handlers.spawn(async move {
-                                respond_embedding(stream, &entered, &release).await
+                                respond_embedding(stream, &entered, &release, expected_key.as_deref(), &authorized_requests).await
                             });
                         }
                         result = handlers.join_next(), if !handlers.is_empty() => {
@@ -242,6 +254,7 @@ impl GatedEmbedding {
             endpoint,
             entered,
             release,
+            authorized_requests,
             server,
         }
     }
@@ -267,6 +280,8 @@ async fn respond_embedding(
     mut stream: TcpStream,
     entered: &Semaphore,
     release: &Semaphore,
+    expected_key: Option<&str>,
+    authorized_requests: &AtomicUsize,
 ) -> std::io::Result<()> {
     let mut bytes = Vec::new();
     let mut buffer = [0; 4096];
@@ -278,6 +293,16 @@ async fn respond_embedding(
         bytes.extend_from_slice(&buffer[..count]);
         if let Some(end) = bytes.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
             let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+            if let Some(expected_key) = expected_key
+                && !headers.lines().any(|line| {
+                    line == format!("authorization: bearer {expected_key}").to_ascii_lowercase()
+                })
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Expected the newly configured provider credential",
+                ));
+            }
             let length = headers
                 .lines()
                 .find_map(|line| line.strip_prefix("content-length:"))
@@ -297,6 +322,7 @@ async fn respond_embedding(
     }
     let request: serde_json::Value =
         serde_json::from_slice(&bytes[body_start..body_start + body_length])?;
+    authorized_requests.fetch_add(1, Ordering::SeqCst);
     let inputs = request["input"].as_array().expect("text inputs");
     if inputs
         .iter()
@@ -849,6 +875,113 @@ fn remote_allow_once_covers_the_cli_build_and_following_query_without_a_grant() 
         );
         assert_eq!(String::from_utf8_lossy(&output.stdout), "No matches.\n");
         assert!(!String::from_utf8_lossy(&output.stderr).contains("setup-test-secret"));
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_remote_credential_can_be_saved_before_build_and_query() {
+    let embedding = GatedEmbedding::start_with_credential(Some("entered-test-secret".into())).await;
+    for mode in ["direct", "server"] {
+        let mut fixture = Fixture::new();
+        fixture.success(&[
+            "--config",
+            "model",
+            "set",
+            "qwen/text-embedding-v4",
+            "--default",
+            "--endpoint",
+            &embedding.endpoint,
+        ]);
+        fs::write(
+            fixture.root.path().join("needle.txt"),
+            "needle workspace documentation",
+        )
+        .expect("source file");
+        if mode == "server" {
+            fixture.start_server();
+        }
+        let command =
+            fixture.command(&["--mode", mode, "needle", "--refresh", "off", "--no-color"]);
+        let before = embedding.authorized_requests.load(Ordering::SeqCst);
+        let output = success(
+            tokio::task::spawn_blocking(move || {
+                terminal::run(
+                    command,
+                    &[
+                        ("Enter Build", b"\x1b[C"),
+                        ("Enter Continue", b"\r"),
+                        ("Enter Save and continue", b"\r"),
+                        (
+                            "Enter an API Key to continue.",
+                            b"\x1b[200~  entered-test-secret\r\n\x1b[201~",
+                        ),
+                        ("API Key  [ *******************", b"\r"),
+                        ("Enter Confirm", b"\x1b[B\x1b[B\r"),
+                        ("Credential available", b"\r"),
+                        ("Enter Confirm", b"\r"),
+                    ],
+                )
+            })
+            .await
+            .expect("interactive setup"),
+        );
+        assert!(
+            embedding.authorized_requests.load(Ordering::SeqCst) >= before + 2,
+            "the build and subsequent query must both use the entered credential"
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("needle.txt"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("entered-test-secret"));
+        assert!(stderr.contains("Index ready"));
+        let config: serde_json::Value = serde_json::from_slice(
+            &fs::read(fixture.user.path().join(".zvec-grep/config.json")).expect("provider config"),
+        )
+        .expect("config JSON");
+        assert_eq!(config["providers"]["qwen"]["apiKey"], "entered-test-secret");
+        assert_eq!(
+            config["models"]["qwen/text-embedding-v4"]["endpoint"],
+            embedding.endpoint
+        );
+        let manifest = fs::read_to_string(fixture.root.path().join(".zvec-grep/manifest.json"))
+            .expect("index manifest");
+        assert!(!manifest.contains("entered-test-secret"));
+        assert!(
+            !fixture
+                .root
+                .path()
+                .join(".zvec-grep/authorization.json")
+                .exists()
+        );
+        fixture.assert_model(mode, "qwen/text-embedding-v4");
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn cancelling_missing_credential_input_does_not_save_or_build() {
+    for mode in ["direct", "server"] {
+        for cancellation in [b"\x1b".as_slice(), b"\x03".as_slice()] {
+            let mut fixture = Fixture::new();
+            if mode == "server" {
+                fixture.start_server();
+            }
+            let output = terminal::run(
+                fixture.command(&["--mode", mode, "--fts", "needle", "--no-color"]),
+                &[
+                    ("Enter Build", b"\x1b[C"),
+                    ("Enter Continue", b"\r"),
+                    ("Enter Save and continue", b"unsaved-test-secret"),
+                    ("API Key  [ *******************", cancellation),
+                ],
+            );
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("unsaved-test-secret"));
+            assert!(!fixture.user.path().join(".zvec-grep/config.json").exists());
+            assert!(!fixture.root.path().join(".zvec-grep").exists());
+            assert!(!fixture.user.path().join("models").exists());
+        }
     }
 }
 

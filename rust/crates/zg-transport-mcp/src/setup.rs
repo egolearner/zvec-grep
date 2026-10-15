@@ -470,7 +470,7 @@ fn form(phase: &Phase) -> (String, Value) {
                 "const": model.reference,
                 "title": format!("{} · {} · {}", if model.local { "Local" } else { "Remote" }, model.reference,
                     if model.local { if model.downloaded { "Downloaded" } else { "Download required" } }
-                    else if model.configured { "Configured · Credential available" } else { "Credential available" })
+                    else { "Credential available" })
             })).collect::<Vec<_>>();
             let default = setup
                 .default_model

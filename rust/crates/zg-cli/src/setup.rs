@@ -1,5 +1,8 @@
 //! Terminal index setup, with independent selection positions for both model tabs.
 
+mod credential;
+pub use credential::prompt_setup_credential;
+
 use std::{
     io::{self, Write},
     path::Path,
@@ -107,8 +110,8 @@ impl Screen {
     }
 }
 
-pub struct ModelSelection<'a> {
-    setup: &'a IndexSetup,
+pub struct ModelSelection {
+    setup: IndexSetup,
     tab: usize,
     positions: [usize; 2],
 }
@@ -119,11 +122,11 @@ enum SelectionResult {
     Cancelled,
 }
 
-impl<'a> ModelSelection<'a> {
+impl ModelSelection {
     #[must_use]
-    pub fn new(setup: &'a IndexSetup) -> Self {
+    pub fn new(setup: &IndexSetup) -> Self {
         let mut selection = Self {
-            setup,
+            setup: setup.clone(),
             tab: 0,
             positions: [0, 0],
         };
@@ -140,7 +143,16 @@ impl<'a> ModelSelection<'a> {
         selection
     }
 
-    fn choices(&self) -> Vec<&'a EmbeddingChoice> {
+    /// Refreshes a provider's credential status without resetting either tab.
+    pub fn set_provider_credential_available(&mut self, provider: &str) {
+        for model in &mut self.setup.models {
+            if !model.local && model.reference.split('/').next() == Some(provider) {
+                model.credential_available = true;
+            }
+        }
+    }
+
+    fn choices(&self) -> Vec<&EmbeddingChoice> {
         self.setup
             .models
             .iter()
@@ -167,9 +179,7 @@ impl<'a> ModelSelection<'a> {
                 self.positions[self.tab] = (self.positions[self.tab] + 1) % count;
             }
             KeyCode::Enter => {
-                if let Some(model) = self.choices().get(self.positions[self.tab])
-                    && model.available()
-                {
+                if let Some(model) = self.choices().get(self.positions[self.tab]) {
                     return Some(SelectionResult::Selected((*model).clone()));
                 }
             }
@@ -216,19 +226,12 @@ impl<'a> ModelSelection<'a> {
                             format!(" · {} MiB", bytes.div_ceil(1024 * 1024))
                         })
             } else {
-                format!(
-                    "{} · {}",
-                    if model.configured {
-                        "Configured"
-                    } else {
-                        "Not configured"
-                    },
-                    if model.credential_available {
-                        "Credential available"
-                    } else {
-                        "Missing API credential"
-                    }
-                )
+                if model.credential_available {
+                    "Credential available"
+                } else {
+                    "Missing API credential"
+                }
+                .to_owned()
             };
             lines.push(format!(
                 "  {} {:width$}  {status}",
@@ -248,10 +251,7 @@ impl<'a> ModelSelection<'a> {
             if self.tab == 0 { "Build" } else { "Continue" }
         ));
         if choices.get(active).is_some_and(|model| !model.available()) {
-            lines.push(
-                "  Configure credentials with zg --config provider set <provider> --api-key <key>"
-                    .into(),
-            );
+            lines.push("  Continue to set an API Key before building.".into());
         }
         lines
     }
@@ -481,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_positions_survive_switches_and_missing_credentials_cannot_confirm() {
+    fn tab_positions_survive_switches_and_missing_credentials_can_confirm() {
         let setup = setup();
         let mut picker = ModelSelection::new(&setup);
         assert_eq!(picker.tab, 1);
@@ -491,7 +491,16 @@ mod tests {
         picker.key(key(KeyCode::Right));
         assert_eq!(picker.positions, [1, 1]);
         picker.key(key(KeyCode::Up));
-        assert!(picker.key(key(KeyCode::Enter)).is_none());
+        let Some(SelectionResult::Selected(missing)) = picker.key(key(KeyCode::Enter)) else {
+            panic!("select model to configure credentials");
+        };
+        assert_eq!(missing.reference, "remote/missing");
+        assert!(!missing.credential_available);
+        picker.set_provider_credential_available("remote");
+        assert_eq!(picker.positions, [1, 0]);
+        let lines = picker.lines(Path::new("/workspace"), 24).join("\n");
+        assert!(!lines.contains("Missing API credential"));
+        assert!(lines.contains("Credential available"));
         picker.key(key(KeyCode::Left));
         let Some(SelectionResult::Selected(chosen)) = picker.key(key(KeyCode::Enter)) else {
             panic!("selected model");

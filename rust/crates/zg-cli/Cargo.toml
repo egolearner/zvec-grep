@@ -10,7 +10,7 @@ publish.workspace = true
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
-crossterm.workspace = true
+crossterm = { workspace = true, features = ["bracketed-paste"] }
 serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

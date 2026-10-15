@@ -17,6 +17,7 @@ pub use management::{
 pub use progress::IndexProgressDisplay;
 pub use setup::{
     IndexCancellation, ModelSelection, SetupAuthorizationDecision, prompt_setup_authorization,
+    prompt_setup_credential,
 };
 pub use status::{write_info_result, write_info_with_options};
 
