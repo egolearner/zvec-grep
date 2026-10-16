@@ -147,6 +147,19 @@ jobs:
           echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
           echo "ZVEC_LIB_DIR=$GITHUB_WORKSPACE/rust/target/zvec-runtime" >> "$GITHUB_ENV"
           echo "MACOSX_DEPLOYMENT_TARGET=14.0" >> "$GITHUB_ENV"
+      - name: Use Clang for Windows ARM64 model runtimes
+        if: inputs.target == 'win32-arm64-msvc'
+        run: |
+          # ggml's ARM CPU backend requires Clang for inline assembly.
+          $clang = (Get-Command clang).Source
+          $clangxx = (Get-Command clang++).Source
+          & $clang --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "CC=$clang" >> $env:GITHUB_ENV
+          "CXX=$clangxx" >> $env:GITHUB_ENV
+          "CMAKE_GENERATOR=Ninja" >> $env:GITHUB_ENV
+          "CMAKE_C_COMPILER_TARGET=aarch64-pc-windows-msvc" >> $env:GITHUB_ENV
+          "CMAKE_CXX_COMPILER_TARGET=aarch64-pc-windows-msvc" >> $env:GITHUB_ENV
       - name: Build the native target
         run: npm run build
       - name: Apply local macOS signatures after building
