@@ -201,7 +201,7 @@ async fn an_existing_index_preserves_the_original_model_not_found_error() {
 }
 
 #[tokio::test]
-async fn modern_setup_requires_confirmation_returns_a_background_job_and_rejects_replay() {
+async fn modern_setup_accepts_key_reordering_binds_arguments_and_rejects_replay() {
     tokio::time::timeout(Duration::from_secs(15), async {
         let root = tempfile::tempdir().expect("workspace");
         let jobs = Arc::new(Jobs::default());
@@ -228,7 +228,14 @@ async fn modern_setup_requires_confirmation_returns_a_background_job_and_rejects
         .serve(client_io)
         .await
         .expect("client");
-        let original = request(root.path());
+        let mut original = request(root.path());
+        original.arguments.as_mut().expect("arguments").insert(
+            "globs".into(),
+            json!([
+                {"pattern": "*.rs", "caseInsensitive": false},
+                {"pattern": "!target/**", "caseInsensitive": false}
+            ]),
+        );
         let CallToolResponse::InputRequired(required) = client
             .call_tool_once(original.clone())
             .await
@@ -238,10 +245,25 @@ async fn modern_setup_requires_confirmation_returns_a_background_job_and_rejects
         };
         assert!(jobs.0.lock().expect("jobs").is_empty());
         assert!(!root.path().join(".zvec-grep").exists());
-        let retry = answer(
+        let mut retry = answer(
             original.clone(),
             required.request_state.expect("state"),
             &json!({"model": "local/potion-code-16m-v2"}),
+        );
+        retry.arguments = retry
+            .arguments
+            .map(|arguments| arguments.into_iter().rev().collect());
+        for rule in retry.arguments.as_mut().expect("arguments")["globs"]
+            .as_array_mut()
+            .expect("rules")
+        {
+            let fields = rule.as_object().expect("rule").clone();
+            *rule = Value::Object(fields.into_iter().rev().collect());
+        }
+        assert_ne!(
+            serde_json::to_vec(&retry.arguments).expect("reordered arguments"),
+            serde_json::to_vec(&original.arguments).expect("original arguments"),
+            "the fixture must change serialized object key order"
         );
         let mut changed = retry.clone();
         changed
@@ -250,6 +272,17 @@ async fn modern_setup_requires_confirmation_returns_a_background_job_and_rejects
             .expect("args")
             .insert("fts".into(), json!("changed"));
         assert!(client.call_tool_once(changed).await.is_err());
+        let mut changed_value = retry.clone();
+        changed_value.arguments.as_mut().expect("arguments")["globs"][0]["caseInsensitive"] =
+            true.into();
+        let mut changed_array = retry.clone();
+        changed_array.arguments.as_mut().expect("arguments")["globs"]
+            .as_array_mut()
+            .expect("rules")
+            .reverse();
+        for changed in [changed_value, changed_array] {
+            assert!(client.call_tool_once(changed).await.is_err());
+        }
         let result = value(
             client
                 .call_tool_once(retry.clone())

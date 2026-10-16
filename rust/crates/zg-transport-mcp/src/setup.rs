@@ -442,12 +442,10 @@ fn binding(request: &CallToolRequestParams, context: &RequestContext<RoleServer>
         .get::<http::request::Parts>()
         .and_then(|parts| parts.headers.get(http::header::AUTHORIZATION))
         .map_or(&[][..], |value| value.as_bytes());
-    Sha256::digest(
-        json!([request.name, request.arguments, principal])
-            .to_string()
-            .as_bytes(),
-    )
-    .to_vec()
+    let mut binding = json!([request.name, request.arguments, principal]);
+    // Object key order is not part of request identity; array order and values are.
+    binding.sort_all_objects();
+    Sha256::digest(binding.to_string().as_bytes()).to_vec()
 }
 
 fn accepted_content(response: &Value) -> Result<Value, EngineError> {
