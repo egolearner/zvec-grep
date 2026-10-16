@@ -14,6 +14,12 @@ reason = "文件命中同级排序保留跨运行确定的原生路径顺序，�
 removal_condition = "两端统一文件选择、结构元数据和排序契约后更新对照；不得为复制旧行为而破坏 Rust 已有扫描规则。"
 
 [[difference]]
+id = "rust-pi-agent-integration"
+owner = "CLI/installer"
+reason = "Rust adds the pi install/uninstall target for native user-level MCP, stable ownership and active global context. The TypeScript installer does not support this target. Both transports retain shared daemon behavior; native client limitations require manual Remote Embedding authorization. Validation: pi_install and CLI help integration tests."
+removal_condition = "The TypeScript installer gains equivalent support or its compatibility surface is retired."
+
+[[difference]]
 id = "watcher-same-path-last-event-wins"
 owner = "watcher/scanner"
 reason = "修复 TypeScript ChangeSet 在 delete 后同路径 recreate 被旧删除事件吞掉的问题；同一路径按事件到达顺序以后到事件为准。"
