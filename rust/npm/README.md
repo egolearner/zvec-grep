@@ -59,8 +59,8 @@ and MSVC. Its zvec SDK is built from the same pinned revision as the Intel
 macOS SDK because zvec-rust 0.7.2 supplies no Windows ARM64 prebuilt library.
 The resulting DLLs and Jieba dictionaries are cached and bundled in
 `@zvec/zvec-grep-win32-arm64-msvc`.
-The Rust model runtimes use Clang and Ninja because ggml's ARM CPU backend
-requires Clang; the zvec SDK itself uses MSVC.
+The Rust model runtimes use Clang's MSVC-compatible `clang-cl` frontend and
+Ninja because ggml's ARM CPU backend requires Clang; the zvec SDK itself uses MSVC.
 
 Explicit publication runs from a `rust-v<version>`-tagged commit on `main` and
 uses npm provenance with trusted publishing or `NPM_TOKEN`. Native packages are

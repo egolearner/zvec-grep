@@ -467,8 +467,8 @@ Windows ARM64 builds and tests natively on `windows-11-arm` with ARM64 Node,
 Rust, and MSVC. It builds the zvec SDK from the same pinned source revision
 and prepares the ARM64 ONNX Runtime from the locked dependency's distribution
 manifest. npm selects `@zvec/zvec-grep-win32-arm64-msvc` for ARM64 Node on Windows.
-The Rust model runtime build uses Clang and Ninja because ggml's ARM CPU backend
-does not support the MSVC compiler.
+The Rust model runtime build uses Clang's MSVC-compatible `clang-cl` frontend
+and Ninja because ggml's ARM CPU backend does not support the MSVC compiler.
 
 Download the `rust-release-<version>` artifact from the successful workflow run
 and unzip it. It contains all six platform tarballs, the meta tarball,
