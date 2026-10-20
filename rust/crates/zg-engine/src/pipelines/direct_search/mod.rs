@@ -24,7 +24,8 @@ use crate::{
 };
 
 use self::structure::{
-    EnrichedLexicalMatch, StructureEnrichmentResult, enrich_lexical_matches_with_structure,
+    EnrichedLexicalMatch, RG_STRUCTURE_ENRICH_FILE_LIMIT, StructureEnrichmentResult,
+    enrich_lexical_matches_with_structure,
 };
 
 const DEFAULT_MAX_CONCURRENT_SEARCHES: usize = 2;
@@ -43,21 +44,25 @@ impl DirectSearchService {
     }
 
     pub(crate) async fn context(&self, options: ContextOptions) -> EngineResult<ContextResult> {
-        self.context_with_selected_files(options, None).await
+        self.context_with_selected_files(options, None, RG_STRUCTURE_ENRICH_FILE_LIMIT)
+            .await
     }
 
     pub(super) async fn context_selected_files(
         &self,
         options: ContextOptions,
         files: Vec<PathBuf>,
+        structure_file_limit: usize,
     ) -> EngineResult<ContextResult> {
-        self.context_with_selected_files(options, Some(files)).await
+        self.context_with_selected_files(options, Some(files), structure_file_limit)
+            .await
     }
 
     async fn context_with_selected_files(
         &self,
         options: ContextOptions,
         selected_files: Option<Vec<PathBuf>>,
+        structure_file_limit: usize,
     ) -> EngineResult<ContextResult> {
         let root = std::path::absolute(options.root.as_deref().unwrap_or_else(|| Path::new(".")))
             .map_err(|error| {
@@ -104,6 +109,7 @@ impl DirectSearchService {
             &root,
             std::mem::take(&mut reply.matches),
             structure_max_file_size_bytes,
+            structure_file_limit,
         );
         let structure_duration = structure_started.elapsed();
         let mut result = context_from_lexical(

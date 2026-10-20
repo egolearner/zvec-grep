@@ -280,6 +280,51 @@ fn path_lookup_reports_file_and_text_truncation_without_indexing_in_all_modes() 
 }
 
 #[test]
+fn path_lookup_deduplicates_entities_beyond_100_files_in_every_mode() {
+    let root = tempfile::tempdir().expect("workspace");
+    for index in 0..101 {
+        let repeated = if index == 100 { "  // auth.ts\n" } else { "" };
+        std::fs::write(
+            root.path().join(format!("{index:03}.ts")),
+            format!(
+                "function load() {{\n  // auth.ts\n  // before\n  // middle\n  // after\n{repeated}}}\n"
+            ),
+        )
+        .expect("source references");
+    }
+    for mode in ["direct", "server", "auto"] {
+        let output = run(root.path(), &["auth.ts", "--mode", mode, "--limit", "101"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{mode}: {stderr}");
+        assert_eq!(stderr, PATH_LOOKUP_NOTICE, "{mode}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.matches("[function load]").count(),
+            101,
+            "{mode}: {stdout}"
+        );
+        assert!(stdout.contains("100.ts\n"), "{mode}: {stdout}");
+
+        let output = run(root.path(), &["auth.ts", "--mode", mode, "--limit", "100"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{mode}: {stderr}");
+        assert!(stderr.starts_with(PATH_LOOKUP_NOTICE), "{mode}: {stderr}");
+        assert!(
+            stderr.contains("coverage is incomplete"),
+            "{mode}: {stderr}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .matches("[function load]")
+                .count(),
+            100
+        );
+    }
+    assert!(!root.path().join(".zvec-grep").exists());
+    assert!(!root.path().join("state").exists());
+}
+
+#[test]
 fn path_lookup_smart_case_highlights_only_literal_matches_in_every_mode() {
     let root = tempfile::tempdir().expect("workspace");
     std::fs::write(root.path().join("refs.txt"), "auth.ts\nAUTH.ts\nAUTHXts\n")

@@ -82,6 +82,9 @@ async fn literal_fallback(
                 ..ContextOptions::default()
             },
             files.paths,
+            // Each matched file contributes at least one result. Enrich enough files
+            // for the requested results plus one extra result to detect truncation.
+            limit.saturating_add(1),
         )
         .await?;
     deduplicate_and_limit(&mut result, limit);
@@ -628,6 +631,90 @@ mod tests {
             }
         }
         engine.close();
+    }
+
+    #[tokio::test]
+    async fn literal_fallback_deduplicates_entities_after_more_than_100_files() {
+        for (extension, source) in [
+            (
+                "ts",
+                "function load() {\n  // auth.ts\n  // before\n  // middle\n  // after\n",
+            ),
+            ("md", "# Reference\n\nauth.ts\n\npadding\n\n"),
+        ] {
+            let root = tempfile::tempdir().expect("workspace");
+            for index in 0..101 {
+                let repeated = if index == 100 { "auth.ts\n" } else { "" };
+                let content = if extension == "ts" {
+                    format!("{source}  // {repeated}\n}}\n")
+                } else {
+                    format!("{source}\n{repeated}")
+                };
+                fs::write(root.path().join(format!("{index:03}.{extension}")), content)
+                    .expect("source references");
+            }
+            let engine = ZvecGrep::new();
+            let direct = engine
+                .context(ContextOptions {
+                    root: Some(root.path().to_path_buf()),
+                    query: Some("auth.ts".to_owned()),
+                    rg: true,
+                    rg_options: RgOptions {
+                        fixed_strings: true,
+                        ..RgOptions::default()
+                    },
+                    ..ContextOptions::default()
+                })
+                .await
+                .expect("ordinary rg retains its enrichment budget");
+            let structure = direct.diagnostics.structure.expect("structure diagnostics");
+            assert_eq!(structure.file_limit, 100);
+            assert_eq!(structure.enriched_files, 100);
+            assert!(structure.truncated);
+            assert!(direct.items.last().expect("last match").container.is_none());
+
+            for limit in [101, 100, 102, 0, 1, usize::MAX] {
+                let mut request = options(root.path(), "auth.ts");
+                request.limit = Some(limit);
+                let PathLookupResult::Text(result) = engine
+                    .lookup_path(request)
+                    .await
+                    .expect("lookup beyond the ordinary rg enrichment budget")
+                else {
+                    panic!("no file has the queried name");
+                };
+                assert_eq!(result.items.len(), limit.min(101), "{extension}, {limit}");
+                assert_eq!(
+                    result.coverage,
+                    if limit < 101 {
+                        ContextCoverage::RgTruncated
+                    } else {
+                        ContextCoverage::RgExhaustive
+                    },
+                    "{extension}, {limit}: repeated matches must not imply more entities"
+                );
+                assert_eq!(
+                    result
+                        .diagnostics
+                        .rg
+                        .as_ref()
+                        .expect("rg diagnostics")
+                        .truncated,
+                    limit < 101
+                );
+                assert!(result.items.iter().all(|item| item.container.is_some()));
+                if limit >= 101 {
+                    let structure = result
+                        .diagnostics
+                        .structure
+                        .as_ref()
+                        .expect("structure diagnostics");
+                    assert_eq!(structure.enriched_files, 101);
+                    assert!(!structure.truncated);
+                }
+            }
+            engine.close();
+        }
     }
 
     #[tokio::test]
