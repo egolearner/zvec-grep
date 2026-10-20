@@ -260,6 +260,53 @@ fn empty_lists_and_partial_traversal_errors_have_rg_exit_codes() -> Result<(), B
 }
 
 #[test]
+fn ignore_parse_errors_fail_with_partial_or_empty_file_lists() -> Result<(), Box<dyn Error>> {
+    for ignore_name in [".ignore", ".gitignore"] {
+        let root = TempDir::new()?;
+        fs::create_dir(root.path().join(".git"))?;
+        let source = root.path().join("src");
+        fs::create_dir(&source)?;
+        fs::write(source.join("keep.ts"), "body")?;
+        fs::write(source.join("ignored.ts"), "body")?;
+        for excluded in ["ignored.ts", "*.ts"] {
+            fs::write(source.join(ignore_name), format!("{{invalid\n{excluded}\n"))?;
+            for mode in ["direct", "server", "auto"] {
+                let output = run(root.path(), mode, &[]);
+                assert_eq!(
+                    output.status.code(),
+                    Some(2),
+                    "{mode} {ignore_name}: {output:?}"
+                );
+                assert_eq!(
+                    paths(&output),
+                    if excluded == "ignored.ts" {
+                        vec![PathBuf::from("src/keep.ts")]
+                    } else {
+                        Vec::new()
+                    },
+                    "{mode} {ignore_name} {excluded}"
+                );
+                let stderr = String::from_utf8(output.stderr)?;
+                assert!(stderr.contains(ignore_name), "{stderr}");
+                assert!(stderr.contains("{invalid"), "{stderr}");
+            }
+        }
+        let disable = if ignore_name == ".gitignore" {
+            "--no-ignore-vcs"
+        } else {
+            "--no-ignore-dot"
+        };
+        for mode in ["direct", "server", "auto"] {
+            assert_files(
+                &run(root.path(), mode, &[disable]),
+                &["src/ignored.ts", "src/keep.ts"],
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn null_output_and_literal_paths_are_safe_for_scripts() -> Result<(), Box<dyn Error>> {
     let root = TempDir::new()?;
     for file in ["space name.ts", "中文.ts", "--files"] {

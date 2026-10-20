@@ -90,6 +90,9 @@ fn list_sync(root: &Path, mut request: LexicalSearchRequest) -> EngineResult<Fil
                     continue;
                 }
             };
+            if let Some(error) = entry.error() {
+                result.errors.push(error.to_string());
+            }
             let file = entry.file_type().is_some_and(|kind| kind.is_file())
                 || (entry.depth() == 0 && entry.path().is_file());
             if !file || !matches_modified_time(entry.path(), &request) {
