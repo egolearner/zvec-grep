@@ -1,4 +1,5 @@
 name: Rust CI
+run-name: Rust CI profile experiment · ${{ inputs.phase || 'cold' }}
 
 on:
   push:
@@ -18,6 +19,12 @@ on:
       - ".gitignore"
       - "!**/*.md"
   workflow_dispatch:
+    inputs:
+      phase:
+        description: Cache phase label; run cold once, then warm on the same commit
+        type: choice
+        default: cold
+        options: [cold, warm]
 
 permissions: {}
 
@@ -69,27 +76,48 @@ jobs:
         run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
 
   test:
-    name: rust test (${{ matrix.os }})
+    name: rust test (${{ matrix.os }}, ${{ matrix.profile }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 45 || 30 }}
+    timeout-minutes: 60
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        profile: [debug, release]
+    defaults:
+      run:
+        working-directory: candidate/rust
     steps:
       - uses: actions/checkout@v6
         with:
+          path: candidate
           persist-credentials: false
       - name: Install the pinned Rust toolchain
         run: rustup show active-toolchain
       - name: Cache Rust dependencies
+        id: cargo-cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
-          prefix-key: rust-ci-v2
-          workspaces: rust -> target
-          save-if: ${{ github.event_name != 'pull_request' }}
+          prefix-key: rust-ci-profile-experiment-v1
+          shared-key: ${{ matrix.profile }}
+          workspaces: candidate/rust -> target
+          save-if: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'egolearner/zvec-grep' }}
+      - name: Check the expected cache phase
+        shell: bash
+        env:
+          PHASE: ${{ inputs.phase }}
+          CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
+        run: |
+          if [[ "$PHASE" == warm && "$CACHE_HIT" != true ]]; then
+            echo 'Expected an exact warm cache hit' >&2
+            exit 1
+          fi
+          if [[ "$PHASE" == cold && "$CACHE_HIT" == true ]]; then
+            echo 'Expected an empty experiment cache namespace' >&2
+            exit 1
+          fi
       - name: Install cargo-nextest
         uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
@@ -102,7 +130,68 @@ jobs:
           echo "TMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
           echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Run workspace tests
-        run: cargo nextest run --locked --workspace --all-targets --no-fail-fast
+        run: cargo nextest run --locked --workspace --all-targets --no-fail-fast ${{ matrix.profile == 'release' && '--release' || '' }}
       - name: Smoke test the CLI
         shell: bash
-        run: ./target/debug/zg${{ runner.os == 'Windows' && '.exe' || '' }} --rg "zvec-grep Rust rewrite" README.md
+        run: ./target/${{ matrix.profile }}/zg${{ runner.os == 'Windows' && '.exe' || '' }} --rg "zvec-grep Rust rewrite" README.md
+
+  retrieval-package:
+    name: retrieval package (${{ matrix.cache }})
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'egolearner/zvec-grep'
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        cache: [none, ci-release]
+    defaults:
+      run:
+        working-directory: candidate/rust
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Check out the selected Rust source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: candidate
+          persist-credentials: false
+      - name: Install the candidate's pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Restore CI release dependencies
+        if: matrix.cache == 'ci-release'
+        id: cargo-cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          prefix-key: rust-ci-profile-experiment-v1
+          shared-key: release
+          workspaces: candidate/rust -> target
+          save-if: false
+      - name: Require an exact CI cache hit
+        if: matrix.cache == 'ci-release'
+        env:
+          CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
+        run: test "$CACHE_HIT" = true
+      - name: Build and pack the selected Rust candidate
+        run: |
+          npm ci
+          npm run pack:local
+          mapfile -t packages < <(find dist/npm -maxdepth 1 -type f -name '*.tgz' -print)
+          test "${#packages[@]}" -eq 1
+          node "$GITHUB_WORKSPACE/benchmarks/shared/rust-package-cache.mjs" create \
+            --source .. \
+            --package "${packages[0]}" \
+            --output "$RUNNER_TEMP/rust-package-cache"
+      - name: Verify the candidate package identity
+        env:
+          CANDIDATE_COMMIT: ${{ github.sha }}
+        run: |
+          node "$GITHUB_WORKSPACE/benchmarks/shared/rust-package-cache.mjs" verify \
+            --directory "$RUNNER_TEMP/rust-package-cache" \
+            --commit "$CANDIDATE_COMMIT"
+      - name: Smoke test the packaged CLI in both modes
+        run: node scripts/npm-local.mjs smoke --no-build
