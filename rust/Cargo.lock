@@ -4051,6 +4051,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "grep",
  "serde_json",
  "tempfile",
  "thiserror",

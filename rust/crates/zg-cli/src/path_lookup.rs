@@ -5,6 +5,7 @@ use std::{
     path::Path,
 };
 
+use grep::{matcher::Matcher, regex::RegexMatcherBuilder};
 use zg_engine::api::{
     context::{
         ContextResult,
@@ -312,42 +313,30 @@ fn field(writer: &mut impl Write, theme: StatusTheme, label: &str, value: &str) 
 }
 
 fn highlight(value: &str, query: &str, color: bool) -> String {
-    if !color {
+    if !color || query.is_empty() {
         return value.to_owned();
     }
-    let lower = value.to_ascii_lowercase();
-    let mut ranges: Vec<_> = std::iter::once(query)
-        .chain(query.split(|character: char| {
-            !character.is_ascii_alphanumeric() && !matches!(character, '_' | '~')
-        }))
-        .filter(|term| term.len() >= 2)
-        .flat_map(|term| {
-            let term = term.to_ascii_lowercase();
-            lower
-                .match_indices(&term)
-                .map(|(start, text)| (start, start + text.len()))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    ranges.sort_unstable();
-    let mut merged: Vec<(usize, usize)> = Vec::new();
-    for (start, end) in ranges {
-        if let Some(previous) = merged.last_mut()
-            && start <= previous.1
-        {
-            previous.1 = previous.1.max(end);
-        } else {
-            merged.push((start, end));
-        }
-    }
+    let Ok(matcher) = RegexMatcherBuilder::new()
+        .fixed_strings(true)
+        .case_insensitive(query == query.to_lowercase())
+        .build(query)
+    else {
+        return value.to_owned();
+    };
     let mut output = String::new();
     let mut cursor = 0;
-    for (start, end) in merged {
-        output.push_str(&value[cursor..start]);
-        output.push_str("\x1b[1;33m");
-        output.push_str(&value[start..end]);
-        output.push_str("\x1b[0m");
-        cursor = end;
+    if matcher
+        .find_iter(value.as_bytes(), |found| {
+            output.push_str(&value[cursor..found.start()]);
+            output.push_str("\x1b[1;33m");
+            output.push_str(&value[found.start()..found.end()]);
+            output.push_str("\x1b[0m");
+            cursor = found.end();
+            true
+        })
+        .is_err()
+    {
+        return value.to_owned();
     }
     output.push_str(&value[cursor..]);
     output
@@ -486,6 +475,31 @@ mod tests {
             render(&result, false),
             ("No matches.\n".into(), String::new())
         );
+    }
+
+    #[test]
+    fn literal_highlighting_uses_smart_case_and_does_not_highlight_path_components() {
+        for (query, source, expected) in [
+            (
+                "AUTH.ts",
+                "AUTH.ts auth.ts AUTHXts ts",
+                "\x1b[1;33mAUTH.ts\x1b[0m auth.ts AUTHXts ts",
+            ),
+            (
+                "auth.ts",
+                "auth.ts AUTH.ts authXts auth",
+                "\x1b[1;33mauth.ts\x1b[0m \x1b[1;33mAUTH.ts\x1b[0m authXts auth",
+            ),
+            (
+                "路径/é.h",
+                "路径/É.H 路径/é.h É.H",
+                "\x1b[1;33m路径/É.H\x1b[0m \x1b[1;33m路径/é.h\x1b[0m É.H",
+            ),
+            ("a", "a A", "\x1b[1;33ma\x1b[0m \x1b[1;33mA\x1b[0m"),
+        ] {
+            assert_eq!(highlight(source, query, true), expected, "{query}");
+            assert_eq!(highlight(source, query, false), source);
+        }
     }
 
     #[test]

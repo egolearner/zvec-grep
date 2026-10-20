@@ -27,8 +27,6 @@ use crate::{
 
 use super::indexed_search::format_filter::{compile_format_filter, matches_file_name};
 
-const LIVE_CANDIDATE_LIMIT: usize = 200;
-
 pub(crate) async fn lookup(
     direct: &super::direct_search::DirectSearchService,
     options: PathsOptions,
@@ -68,8 +66,8 @@ async fn literal_fallback(
                 root: Some(files.root),
                 rg: true,
                 auto_update: false,
-                // Collect candidates before structural deduplication consumes the caller's limit.
-                limit: Some(LIVE_CANDIDATE_LIMIT.max(limit.saturating_add(1))),
+                // Apply the result limit only after structural deduplication.
+                limit: None,
                 hidden: true,
                 no_ignore: true,
                 follow: true,
@@ -108,6 +106,9 @@ fn deduplicate_and_limit(result: &mut ContextResult, limit: usize) {
             continue;
         }
         selected.push(item);
+        if selected.len() > limit {
+            break;
+        }
     }
     if selected.len() > limit {
         result.coverage = ContextCoverage::RgTruncated;
@@ -118,6 +119,7 @@ fn deduplicate_and_limit(result: &mut ContextResult, limit: usize) {
     }
     result.items = selected;
     if let Some(rg) = &mut result.diagnostics.rg {
+        rg.limit = Some(limit);
         rg.truncated = result.coverage == ContextCoverage::RgTruncated;
     }
 }
@@ -575,6 +577,133 @@ mod tests {
         assert_eq!(result.paths, [PathBuf::from("src/notes.md")]);
         assert_eq!(engine.runtime_snapshot().loaded_models, 0);
         engine.close();
+    }
+
+    #[tokio::test]
+    async fn literal_fallback_limits_unique_containers_after_more_than_200_matches() {
+        let root = fixture(&["refs.md"]);
+        let source = format!(
+            "# Repeated\n\n{}\n# Second\n\na.h\n\n# Third\n\na.h\n",
+            "a.h\n".repeat(210)
+        );
+        fs::write(root.path().join("refs.md"), source).expect("repeated references");
+        let engine = ZvecGrep::new();
+        for limit in [3, 2, 0] {
+            let mut request = options(root.path(), "a.h");
+            request.limit = Some(limit);
+            let PathLookupResult::Text(result) =
+                engine.lookup_path(request).await.expect("literal fallback")
+            else {
+                panic!("no file has the queried name");
+            };
+            assert_eq!(result.items.len(), limit);
+            assert_eq!(
+                result.coverage,
+                if limit < 3 {
+                    ContextCoverage::RgTruncated
+                } else {
+                    ContextCoverage::RgExhaustive
+                }
+            );
+            assert_eq!(
+                result
+                    .diagnostics
+                    .rg
+                    .as_ref()
+                    .expect("rg diagnostics")
+                    .truncated,
+                limit < 3
+            );
+            assert_eq!(
+                result
+                    .diagnostics
+                    .rg
+                    .as_ref()
+                    .expect("rg diagnostics")
+                    .limit,
+                Some(limit)
+            );
+            for (index, item) in result.items.iter().enumerate() {
+                assert_eq!(item.rank, index + 1);
+            }
+        }
+        engine.close();
+    }
+
+    #[tokio::test]
+    async fn literal_fallback_counts_fragmented_functions_and_sections_once() {
+        for (file, source) in [
+            (
+                "refs.ts",
+                format!(
+                    "function load() {{\n  // src/auth.ts\n{}  // src/auth.ts\n}}\nfunction other() {{\n  // src/auth.ts\n}}\n",
+                    "  // padding keeps the matches in separate retrieval fragments\n".repeat(100)
+                ),
+            ),
+            (
+                "refs.md",
+                format!(
+                    "# Repeated\n\nsrc/auth.ts\n\n{}\nsrc/auth.ts\n\n# Repeated\n\nsrc/auth.ts\n",
+                    "Padding keeps the matches in separate retrieval fragments.\n".repeat(100)
+                ),
+            ),
+        ] {
+            let root = fixture(&[file]);
+            fs::write(root.path().join(file), &source).expect("fragmented source");
+            let last_match = source.rfind("src/auth.ts").expect("final reference");
+            let last_line = source[..last_match]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1;
+            let engine = ZvecGrep::new();
+            let direct = engine
+                .context(ContextOptions {
+                    root: Some(root.path().to_path_buf()),
+                    query: Some("src/auth.ts".to_owned()),
+                    rg: true,
+                    rg_options: RgOptions {
+                        fixed_strings: true,
+                        ..RgOptions::default()
+                    },
+                    ..ContextOptions::default()
+                })
+                .await
+                .expect("ordinary rg keeps individual matches");
+            assert_eq!(direct.items.len(), 3, "{file}");
+            assert_ne!(
+                direct.items[0]
+                    .container
+                    .as_ref()
+                    .expect("first fragment")
+                    .range,
+                direct.items[1]
+                    .container
+                    .as_ref()
+                    .expect("second fragment")
+                    .range,
+                "{file}: ordinary rg retains fragment containers"
+            );
+            let mut request = options(root.path(), "src/auth.ts");
+            request.limit = Some(2);
+            let PathLookupResult::Text(result) =
+                engine.lookup_path(request).await.expect("literal fallback")
+            else {
+                panic!("no file has the queried name");
+            };
+            assert_eq!(result.items.len(), 2, "{file}");
+            assert_eq!(
+                result.items[1]
+                    .excerpt_range
+                    .as_ref()
+                    .expect("matched source")
+                    .start_line(),
+                Some(last_line),
+                "{file}: later entities must not be displaced by another fragment"
+            );
+            assert_eq!(result.coverage, ContextCoverage::RgExhaustive, "{file}");
+            engine.close();
+        }
     }
 
     #[tokio::test]

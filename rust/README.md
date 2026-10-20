@@ -243,8 +243,11 @@ File matches do not read or embed contents. If no file matches, lookup searches
 the selected current source text literally using the same scan rules and filters.
 A path mentioned only in source text returns those text matches. No match prints
 `No matches.` instead of unrelated vector neighbors, even with an existing index.
-Text results deduplicate structural containers before applying `--limit` and show
-line numbers, match/context markers, and structural headings. Terminal output also
+Text results deduplicate complete structural entities before applying `--limit`;
+multiple retrieval fragments of one function or Markdown section count once.
+Literal matching and highlighting use the same smart-case rules: queries with
+uppercase letters are case-sensitive; lowercase queries ignore case.
+Results show line numbers, match/context markers, and structural headings. Terminal output also
 shows coverage and per-file/per-hit metadata. Truncated file or text results warn
 on stderr. Unlike the Node.js CLI, truncated text remains local instead of starting
 indexed retrieval; direct, server, and auto modes share this behavior and never

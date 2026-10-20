@@ -72,6 +72,8 @@ impl DirectSearchService {
         let structure_max_file_size_bytes = options.max_file_size_bytes;
         let modified_after_epoch_ms = options.rg_options.modified_after_epoch_ms;
         let modified_before_epoch_ms = options.rg_options.modified_before_epoch_ms;
+        // Path lookup groups fragment hits by their complete owning entity.
+        let use_entity_ranges = selected_files.is_some();
         let request = LexicalSearchRequest {
             signal: options.signal.clone(),
             root: Some(root.clone()),
@@ -104,7 +106,12 @@ impl DirectSearchService {
             structure_max_file_size_bytes,
         );
         let structure_duration = structure_started.elapsed();
-        let mut result = context_from_lexical(normalized.display_query, reply, enrichment);
+        let mut result = context_from_lexical(
+            normalized.display_query,
+            reply,
+            enrichment,
+            use_entity_ranges,
+        );
         result.diagnostics.timings.push(TimingEntry {
             name: "structure_enrichment".to_owned(),
             duration_micros: structure_duration
@@ -181,6 +188,7 @@ fn context_from_lexical(
     query: String,
     reply: LexicalSearchReply,
     enrichment: StructureEnrichmentResult,
+    use_entity_ranges: bool,
 ) -> ContextResult {
     let hits_returned = enrichment.items.len();
     let empty_reason = (hits_returned == 0).then_some({
@@ -232,7 +240,12 @@ fn context_from_lexical(
                     entity_id: None,
                     container: container.map(|value| ContextContainer {
                         entity_id: None,
-                        range: value.range.into(),
+                        range: if use_entity_ranges {
+                            value.entity_range
+                        } else {
+                            value.range
+                        }
+                        .into(),
                         metadata: value.metadata,
                     }),
                     trace: None,

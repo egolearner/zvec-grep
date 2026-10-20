@@ -280,6 +280,29 @@ fn path_lookup_reports_file_and_text_truncation_without_indexing_in_all_modes() 
 }
 
 #[test]
+fn path_lookup_smart_case_highlights_only_literal_matches_in_every_mode() {
+    let root = tempfile::tempdir().expect("workspace");
+    std::fs::write(root.path().join("refs.txt"), "auth.ts\nAUTH.ts\nAUTHXts\n")
+        .expect("source references");
+    for mode in ["direct", "server", "auto"] {
+        let output = run(
+            root.path(),
+            &["AUTH.ts", "--mode", mode, "--color", "always"],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{mode}: {stderr}");
+        assert_eq!(stderr, PATH_LOOKUP_NOTICE);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "refs.txt\n  1-\tauth.ts\n  2:\t\x1b[1;33mAUTH.ts\x1b[0m\n  3-\tAUTHXts\n",
+            "{mode}"
+        );
+    }
+    assert!(!root.path().join(".zvec-grep").exists());
+    assert!(!root.path().join("state").exists());
+}
+
+#[test]
 fn path_lookup_deduplicates_symbols_before_the_limit_and_highlights_only_matching_text() {
     let root = tempfile::tempdir().expect("workspace");
     std::fs::write(

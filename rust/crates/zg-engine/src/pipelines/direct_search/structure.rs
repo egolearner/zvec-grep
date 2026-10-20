@@ -30,11 +30,13 @@ pub(crate) struct EnrichedLexicalMatch {
 
 pub(crate) struct LexicalContainer {
     pub range: Range,
+    pub entity_range: Range,
     pub metadata: Option<EntityMetadata>,
 }
 
 struct StructuralFragment {
     entity_index: usize,
+    entity_range: Range,
     range: Range,
 }
 
@@ -79,6 +81,7 @@ pub(crate) fn enrich_lexical_matches_with_structure(
             enriched_files.insert(item.absolute_path.clone());
             Some(LexicalContainer {
                 range: container.range,
+                entity_range: container.entity_range,
                 metadata: source.metadata.get(&container.entity_index).cloned(),
             })
         } else {
@@ -169,6 +172,7 @@ fn collect_structural_fragments(entities: Vec<ExtractedEntity>) -> StructuralSou
         // several retrieval ranges. It does not create a retrieval fragment.
         fragments.push(StructuralFragment {
             entity_index: entity.index,
+            entity_range: entity.source_range,
             range: entity.source_range,
         });
         let crate::domain::Content::Text(content) = &entity.content else {
@@ -195,6 +199,7 @@ fn collect_structural_fragments(entities: Vec<ExtractedEntity>) -> StructuralSou
             };
             fragments.push(StructuralFragment {
                 entity_index: entity.index,
+                entity_range: entity.source_range,
                 range: Range::Text(range),
             });
         }
