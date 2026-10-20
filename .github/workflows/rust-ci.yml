@@ -94,6 +94,8 @@ jobs:
     defaults:
       run:
         working-directory: candidate/rust
+    env:
+      RUSTUP_HOME: ${{ github.workspace }}/.rustup-pinned
     steps:
       - uses: actions/checkout@v6
         with:
@@ -158,6 +160,8 @@ jobs:
     defaults:
       run:
         working-directory: candidate/rust
+    env:
+      RUSTUP_HOME: ${{ github.workspace }}/.rustup-pinned
     steps:
       - uses: actions/checkout@v6
         with:
