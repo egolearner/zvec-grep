@@ -10,7 +10,7 @@ use crate::{
     EngineError, EngineResult,
     api::{
         context::{
-            ContextOptions,
+            ContextOptions, ContextResult,
             options::RgOptions,
             result::{ContextCoverage, ContextItem},
         },
@@ -33,12 +33,31 @@ pub(crate) async fn lookup(
     direct: &super::direct_search::DirectSearchService,
     options: PathsOptions,
 ) -> EngineResult<PathLookupResult> {
-    let files = selected_files(options.clone()).await?;
-    let paths = matching_paths(&options, &files)?;
+    check_cancelled(&options)?;
+    let query = normalize_query(&options)?;
+    // Select file names before reading content so saved and caller filters remain an intersection.
+    let files = selected_files(&options).await?;
+    let paths = matching_paths(&options, &files, &query)?;
     if !paths.paths.is_empty() || paths.truncated {
         return Ok(PathLookupResult::Files(paths));
     }
-    // Select file names before reading content so saved and caller filters remain an intersection.
+    let result = literal_fallback(direct, options, files).await?;
+    Ok(PathLookupResult::Text(Box::new(result)))
+}
+
+pub(crate) async fn search(options: PathsOptions) -> EngineResult<PathsResult> {
+    check_cancelled(&options)?;
+    let query = normalize_query(&options)?;
+    let files = selected_files(&options).await?;
+    matching_paths(&options, &files, &query)
+}
+
+async fn literal_fallback(
+    direct: &super::direct_search::DirectSearchService,
+    options: PathsOptions,
+    files: PathsResult,
+) -> EngineResult<ContextResult> {
+    // Preserve the original spelling for literal source matches, including path separators.
     let query = options.query.trim().to_owned();
     let ignore_case = query == query.to_lowercase();
     let limit = options.limit.unwrap_or(10);
@@ -67,6 +86,11 @@ pub(crate) async fn lookup(
             files.paths,
         )
         .await?;
+    deduplicate_and_limit(&mut result, limit);
+    Ok(result)
+}
+
+fn deduplicate_and_limit(result: &mut ContextResult, limit: usize) {
     let mut selected: Vec<ContextItem> = Vec::new();
     for item in std::mem::take(&mut result.items) {
         let target = item
@@ -96,17 +120,9 @@ pub(crate) async fn lookup(
     if let Some(rg) = &mut result.diagnostics.rg {
         rg.truncated = result.coverage == ContextCoverage::RgTruncated;
     }
-    Ok(PathLookupResult::Text(Box::new(result)))
 }
 
-pub(crate) async fn search(options: PathsOptions) -> EngineResult<PathsResult> {
-    let files = selected_files(options.clone()).await?;
-    matching_paths(&options, &files)
-}
-
-async fn selected_files(options: PathsOptions) -> EngineResult<PathsResult> {
-    check_cancelled(&options)?;
-    normalize_query(&options)?;
+async fn selected_files(options: &PathsOptions) -> EngineResult<PathsResult> {
     let (root, scan) = workspace_scan(options.root.as_deref())?;
     let policy = Arc::new(ScanPolicy::for_current_source(&root, &scan)?);
     let matcher = GlobMatcher::new(&root, &options.filter.globs)?;
@@ -133,7 +149,7 @@ async fn selected_files(options: PathsOptions) -> EngineResult<PathsResult> {
     if !files.errors.is_empty() {
         return Err(EngineError::storage_failure(files.errors.join("\n")));
     }
-    check_cancelled(&options)?;
+    check_cancelled(options)?;
     let paths = files
         .paths
         .into_iter()
@@ -153,14 +169,17 @@ async fn selected_files(options: PathsOptions) -> EngineResult<PathsResult> {
     })
 }
 
-fn matching_paths(options: &PathsOptions, files: &PathsResult) -> EngineResult<PathsResult> {
-    let query = normalize_query(options)?;
+fn matching_paths(
+    options: &PathsOptions,
+    files: &PathsResult,
+    query: &str,
+) -> EngineResult<PathsResult> {
     let limit = options.limit.unwrap_or(10);
     let mut paths = BinaryHeap::new();
     let mut truncated = false;
     for relative in &files.paths {
         check_cancelled(options)?;
-        if let Some(priority) = path_priority(&query, relative, &files.root.join(relative)) {
+        if let Some(priority) = path_priority(query, relative, &files.root.join(relative)) {
             paths.push((priority, relative.clone()));
             if paths.len() > limit {
                 paths.pop();
@@ -555,6 +574,42 @@ mod tests {
         };
         assert_eq!(result.paths, [PathBuf::from("src/notes.md")]);
         assert_eq!(engine.runtime_snapshot().loaded_models, 0);
+        engine.close();
+    }
+
+    #[tokio::test]
+    async fn literal_fallback_preserves_original_path_spelling_and_smart_case() {
+        let root = fixture(&["normalized.txt", "literal.txt", "uppercase.txt"]);
+        for (file, content) in [
+            ("normalized.txt", "src/auth.ts"),
+            ("literal.txt", r".\src\auth.ts"),
+            ("uppercase.txt", r".\SRC\Auth.ts"),
+        ] {
+            fs::write(root.path().join(file), content).expect("literal reference");
+        }
+        let engine = ZvecGrep::new();
+        for (query, expected) in [
+            (r" .\src\auth.ts ", vec!["literal.txt", "uppercase.txt"]),
+            (r" .\SRC\Auth.ts ", vec!["uppercase.txt"]),
+        ] {
+            let PathLookupResult::Text(result) = engine
+                .lookup_path(options(root.path(), query))
+                .await
+                .expect("literal fallback")
+            else {
+                panic!("no file has the queried name");
+            };
+            assert_eq!(result.query, query.trim());
+            assert_eq!(
+                result
+                    .items
+                    .iter()
+                    .map(|item| item.relative_path.clone())
+                    .collect::<Vec<_>>(),
+                expected.into_iter().map(PathBuf::from).collect::<Vec<_>>()
+            );
+            assert_eq!(result.coverage, ContextCoverage::RgExhaustive);
+        }
         engine.close();
     }
 
