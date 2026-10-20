@@ -25,6 +25,11 @@ on:
         type: choice
         default: cold
         options: [cold, warm]
+      platforms:
+        description: Platforms to include in the profile comparison
+        type: choice
+        default: all
+        options: [all, linux]
 
 permissions: {}
 
@@ -84,7 +89,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ inputs.platforms == 'linux' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]') }}
         profile: [debug, release]
     defaults:
       run:
@@ -94,8 +99,11 @@ jobs:
         with:
           path: candidate
           persist-credentials: false
-      - name: Install the pinned Rust toolchain
-        run: rustup show active-toolchain
+      - name: Use the pinned Rust toolchain for compilation and cache keys
+        shell: bash
+        run: |
+          toolchain="$(rustup show active-toolchain)"
+          rustup default "${toolchain%% *}"
       - name: Cache Rust dependencies
         id: cargo-cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
@@ -160,8 +168,11 @@ jobs:
           ref: ${{ github.sha }}
           path: candidate
           persist-credentials: false
-      - name: Install the candidate's pinned Rust toolchain
-        run: rustup show active-toolchain
+      - name: Use the pinned Rust toolchain for compilation and cache keys
+        shell: bash
+        run: |
+          toolchain="$(rustup show active-toolchain)"
+          rustup default "${toolchain%% *}"
       - name: Restore CI release dependencies
         if: matrix.cache == 'ci-release'
         id: cargo-cache
