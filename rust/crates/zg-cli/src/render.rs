@@ -407,7 +407,7 @@ Managed --rg keeps its pattern and path arguments separate.
 An ordinary single path-shaped query such as auth.ts first matches current file
 names without reading contents. If no name matches, current source is searched
 literally. A complete miss returns No matches., including with a warm index.
-Automatic path lookup prints an info message on stderr; use --hybrid to force
+Automatic path lookup prints a warning on stderr; use --hybrid to force
 hybrid search. Explicit query routes, trace, refresh and symbol options bypass it.
 With --files, every positional argument is an input file or directory; no pattern
 is required. Use -g 'auth.ts' to select files by name.

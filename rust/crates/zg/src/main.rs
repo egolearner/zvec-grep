@@ -320,7 +320,7 @@ async fn execute_request(
     if path_lookup {
         // Current-file lookup is local in every client mode, before index or model admission.
         eprintln!(
-            "info: automatically performing path lookup; use --hybrid to force hybrid search."
+            "warning: automatically performing path lookup; use --hybrid to force hybrid search."
         );
         let engine = ZvecGrep::new();
         let result = engine

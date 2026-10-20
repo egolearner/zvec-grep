@@ -97,7 +97,7 @@ fn removed_flags_and_ambiguous_actions_fail_without_side_effects() {
 }
 
 const PATH_LOOKUP_NOTICE: &str =
-    "info: automatically performing path lookup; use --hybrid to force hybrid search.\n";
+    "warning: automatically performing path lookup; use --hybrid to force hybrid search.\n";
 
 #[test]
 fn file_lookup_prints_ranked_path_matches_in_every_client_mode_without_a_daemon() {

@@ -271,7 +271,7 @@ ripgrep output-format switches other than file listing are rejected; Unicode
 BOM decoding is automatic.
 
 Automatic path lookup emits
-`info: automatically performing path lookup; use --hybrid to force hybrid search.`
+`warning: automatically performing path lookup; use --hybrid to force hybrid search.`
 on stderr only when the default query actually enters that branch. `--hybrid`
 overrides the inference, including ambiguous inputs such as `config.timeout` and
 `v1.2`.

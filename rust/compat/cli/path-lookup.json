@@ -18,6 +18,6 @@
   "expected": {
     "exit_code": 0,
     "stdout": "#1 matchedBy=path a/auth.ts\n",
-    "stderr": "info: automatically performing path lookup; use --hybrid to force hybrid search.\nwarning: more matching files exist; use --limit to show more\n"
+    "stderr": "warning: automatically performing path lookup; use --hybrid to force hybrid search.\nwarning: more matching files exist; use --limit to show more\n"
   }
 }
