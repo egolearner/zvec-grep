@@ -20,7 +20,7 @@ use zg_engine::api::{
 
 use crate::{OutputOptions, theme::StatusTheme};
 
-/// Writes current-file lookup output and any incomplete-coverage warning.
+/// Writes current-file lookup output and fallback or incomplete-coverage warnings.
 ///
 /// # Errors
 /// Returns the underlying output or diagnostic writer error.
@@ -44,6 +44,10 @@ pub fn write_path_lookup_result(
             }
         }
         PathLookupResult::Text(result) => {
+            writeln!(
+                diagnostics,
+                "warning: no matching file paths; searching current file contents literally (rg)."
+            )?;
             write_current_text(&mut writer, result, options, terminal)?;
             if result.coverage == ContextCoverage::RgTruncated {
                 writeln!(
@@ -450,7 +454,10 @@ mod tests {
             output,
             "refs.txt\n  1-\tbefore\n  2:\tImport src/auth.ts\n  3-\tafter\n"
         );
-        assert!(diagnostics.is_empty());
+        assert_eq!(
+            diagnostics,
+            "warning: no matching file paths; searching current file contents literally (rg).\n"
+        );
     }
 
     #[test]
@@ -463,7 +470,10 @@ mod tests {
             "{output}"
         );
         assert!(output.contains("File: refs.txt\nHits: 1\n\n  #1 lexical_match matchedBy=lexical\n  Range: 1-3  Status: fresh\n  Source:\n    1-\tbefore\n    2:\tImport src/auth.ts\n    3-\tafter\n"), "{output}");
-        assert!(diagnostics.is_empty());
+        assert_eq!(
+            diagnostics,
+            "warning: no matching file paths; searching current file contents literally (rg).\n"
+        );
         result.items.clear();
         let result = PathLookupResult::Text(Box::new(result));
         assert!(
@@ -473,7 +483,11 @@ mod tests {
         );
         assert_eq!(
             render(&result, false),
-            ("No matches.\n".into(), String::new())
+            (
+                "No matches.\n".into(),
+                "warning: no matching file paths; searching current file contents literally (rg).\n"
+                    .into()
+            )
         );
     }
 

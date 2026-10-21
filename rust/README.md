@@ -279,6 +279,11 @@ on stderr only when the default query actually enters that branch. `--hybrid`
 overrides the inference, including ambiguous inputs such as `config.timeout` and
 `v1.2`.
 
+When no file path matches and lookup falls back to literal source search, it also
+prints `warning: no matching file paths; searching current file contents literally (rg).`
+on stderr. This appears for both text matches and `No matches.`; stdout contains
+only the search results.
+
 Use `zg --rg --files` for explicit file discovery:
 
 ```sh

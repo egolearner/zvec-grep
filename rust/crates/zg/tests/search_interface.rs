@@ -98,6 +98,8 @@ fn removed_flags_and_ambiguous_actions_fail_without_side_effects() {
 
 const PATH_LOOKUP_NOTICE: &str =
     "warning: automatically performing path lookup; use --hybrid to force hybrid search.\n";
+const TEXT_FALLBACK_NOTICE: &str =
+    "warning: no matching file paths; searching current file contents literally (rg).\n";
 
 #[test]
 fn file_lookup_prints_ranked_path_matches_in_every_client_mode_without_a_daemon() {
@@ -188,6 +190,7 @@ fn explicit_routes_continue_to_indexed_search() {
             !stderr.contains("automatically performing path lookup"),
             "{stderr}"
         );
+        assert!(!stderr.contains(TEXT_FALLBACK_NOTICE), "{stderr}");
     }
 }
 
@@ -214,7 +217,10 @@ fn path_queries_use_current_literal_text_and_truthful_no_matches_without_an_inde
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(output.status.success(), "{mode}: {stderr}");
             assert_eq!(String::from_utf8_lossy(&output.stdout), "No matches.\n");
-            assert_eq!(stderr, PATH_LOOKUP_NOTICE);
+            assert_eq!(
+                stderr,
+                format!("{PATH_LOOKUP_NOTICE}{TEXT_FALLBACK_NOTICE}")
+            );
         }
         for query in ["src/auth.ts", "auth.ts"] {
             let output = run(
@@ -229,7 +235,10 @@ fn path_queries_use_current_literal_text_and_truthful_no_matches_without_an_inde
             assert!(!stdout.contains("decoy.md"), "{stdout}");
             assert!(!stdout.contains("excluded"), "{stdout}");
             assert!(!stdout.contains("ignored"), "{stdout}");
-            assert_eq!(stderr, PATH_LOOKUP_NOTICE);
+            assert_eq!(
+                stderr,
+                format!("{PATH_LOOKUP_NOTICE}{TEXT_FALLBACK_NOTICE}")
+            );
         }
     }
     assert!(!root.path().join(".zvec-grep").exists());
@@ -270,8 +279,12 @@ fn path_lookup_reports_file_and_text_truncation_without_indexing_in_all_modes() 
             "a.txt\n  1-\tbefore\n  2:\tImport missing.ts\n  3-\tafter\n"
         );
         let stderr = String::from_utf8_lossy(&text.stderr);
-        assert!(stderr.starts_with(PATH_LOOKUP_NOTICE), "{stderr}");
+        assert!(
+            stderr.starts_with(&format!("{PATH_LOOKUP_NOTICE}{TEXT_FALLBACK_NOTICE}")),
+            "{stderr}"
+        );
         assert_eq!(stderr.matches(PATH_LOOKUP_NOTICE).count(), 1);
+        assert_eq!(stderr.matches(TEXT_FALLBACK_NOTICE).count(), 1);
         assert!(stderr.contains("coverage is incomplete"), "{stderr}");
         assert!(!stderr.contains("No index found"), "{stderr}");
     }
@@ -296,7 +309,11 @@ fn path_lookup_deduplicates_entities_beyond_100_files_in_every_mode() {
         let output = run(root.path(), &["auth.ts", "--mode", mode, "--limit", "101"]);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{mode}: {stderr}");
-        assert_eq!(stderr, PATH_LOOKUP_NOTICE, "{mode}");
+        assert_eq!(
+            stderr,
+            format!("{PATH_LOOKUP_NOTICE}{TEXT_FALLBACK_NOTICE}"),
+            "{mode}"
+        );
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert_eq!(
             stdout.matches("[function load]").count(),
@@ -308,7 +325,11 @@ fn path_lookup_deduplicates_entities_beyond_100_files_in_every_mode() {
         let output = run(root.path(), &["auth.ts", "--mode", mode, "--limit", "100"]);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{mode}: {stderr}");
-        assert!(stderr.starts_with(PATH_LOOKUP_NOTICE), "{mode}: {stderr}");
+        assert!(
+            stderr.starts_with(&format!("{PATH_LOOKUP_NOTICE}{TEXT_FALLBACK_NOTICE}")),
+            "{mode}: {stderr}"
+        );
+        assert_eq!(stderr.matches(TEXT_FALLBACK_NOTICE).count(), 1);
         assert!(
             stderr.contains("coverage is incomplete"),
             "{mode}: {stderr}"
@@ -336,7 +357,10 @@ fn path_lookup_smart_case_highlights_only_literal_matches_in_every_mode() {
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{mode}: {stderr}");
-        assert_eq!(stderr, PATH_LOOKUP_NOTICE);
+        assert_eq!(
+            stderr,
+            format!("{PATH_LOOKUP_NOTICE}{TEXT_FALLBACK_NOTICE}")
+        );
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
             "refs.txt\n  1-\tauth.ts\n  2:\t\x1b[1;33mAUTH.ts\x1b[0m\n  3-\tAUTHXts\n",
@@ -370,7 +394,10 @@ fn path_lookup_deduplicates_symbols_before_the_limit_and_highlights_only_matchin
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{mode}: {stderr}");
-        assert_eq!(stderr, PATH_LOOKUP_NOTICE);
+        assert_eq!(
+            stderr,
+            format!("{PATH_LOOKUP_NOTICE}{TEXT_FALLBACK_NOTICE}")
+        );
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.starts_with("refs.ts\n"), "{stdout}");
         assert_eq!(stdout.matches("[function load]").count(), 1, "{stdout}");

@@ -1136,7 +1136,10 @@ async fn warm_index_path_lookups_return_current_text_or_no_matches_without_vecto
             assert!(!stdout.contains("anchor.txt"), "{mode}: {stdout}");
             assert_eq!(
                 stderr,
-                "warning: automatically performing path lookup; use --hybrid to force hybrid search.\n"
+                concat!(
+                    "warning: automatically performing path lookup; use --hybrid to force hybrid search.\n",
+                    "warning: no matching file paths; searching current file contents literally (rg).\n"
+                )
             );
             if query == "missing.ts" {
                 assert_eq!(stdout, "No matches.\n");
