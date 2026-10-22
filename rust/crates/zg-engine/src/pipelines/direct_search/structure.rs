@@ -65,14 +65,14 @@ pub(crate) fn enrich_lexical_matches_with_structure(
     let mut enriched = Vec::with_capacity(items.len());
     for item in unique_lexical_matches(items) {
         let container = if let Some(source) = sources_by_file
-            .get(&item.absolute_path)
+            .get(item.absolute_path())
             .and_then(Option::as_ref)
             && let Some(container) = smallest_containing_fragment(
                 source,
                 item.excerpt_range.as_ref().unwrap_or(&item.range),
             ) {
             enriched_items += 1;
-            enriched_files.insert(item.absolute_path.clone());
+            enriched_files.insert(item.absolute_path().to_path_buf());
             Some(LexicalContainer {
                 range: container.range,
                 entity_range: container.entity_range,
@@ -105,33 +105,40 @@ pub(crate) fn enrich_lexical_matches_with_structure(
 
 pub(super) fn lexical_matches_without_structure(
     items: Vec<LexicalMatch>,
-) -> Vec<EnrichedLexicalMatch> {
-    unique_lexical_matches(items)
-        .map(|matched| EnrichedLexicalMatch {
-            matched,
-            container: None,
-        })
-        .collect()
+) -> impl Iterator<Item = EnrichedLexicalMatch> {
+    unique_lexical_matches(items).map(|matched| EnrichedLexicalMatch {
+        matched,
+        container: None,
+    })
 }
 
-fn unique_lexical_matches(items: Vec<LexicalMatch>) -> impl Iterator<Item = LexicalMatch> {
-    let mut seen = HashSet::new();
-    items
-        .into_iter()
-        .filter(move |item| seen.insert(lexical_item_key(item)))
-        .enumerate()
-        .map(|(index, mut item)| {
-            item.rank = index + 1;
-            item
-        })
+fn unique_lexical_matches(mut items: Vec<LexicalMatch>) -> impl Iterator<Item = LexicalMatch> {
+    // Keep first-hit order and every coordinate field while storing each path only once.
+    let mut seen: HashMap<PathBuf, HashSet<TextRange>> = HashMap::new();
+    items.retain(|item| {
+        if let Some(ranges) = seen.get_mut(item.absolute_path()) {
+            ranges.insert(item.range)
+        } else {
+            seen.insert(
+                item.absolute_path().to_path_buf(),
+                HashSet::from([item.range]),
+            );
+            true
+        }
+    });
+    // Reuse the input allocation and let the final collector reserve the exact hit count.
+    items.into_iter().enumerate().map(|(index, mut item)| {
+        item.rank = index + 1;
+        item
+    })
 }
 
 fn unique_lexical_file_paths(items: &[LexicalMatch]) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     items
         .iter()
-        .filter(|item| seen.insert(item.absolute_path.clone()))
-        .map(|item| item.absolute_path.clone())
+        .filter(|item| seen.insert(item.absolute_path()))
+        .map(|item| item.absolute_path().to_path_buf())
         .collect()
 }
 
@@ -286,10 +293,6 @@ fn metadata_specificity(metadata: Option<&EntityMetadata>) -> u8 {
     }
 }
 
-fn lexical_item_key(item: &LexicalMatch) -> (PathBuf, String) {
-    (item.absolute_path.clone(), format!("{:?}", item.range))
-}
-
 #[cfg(test)]
 mod tests {
     use std::{fs, path::Path};
@@ -304,6 +307,43 @@ mod tests {
     };
 
     const STRUCTURE_FILE_LIMIT: usize = 100;
+
+    #[test]
+    fn deduplication_preserves_first_hit_and_complete_coordinate_identity() {
+        let directory = tempdir().expect("workspace");
+        for relative in ["first.txt", "second.txt"] {
+            fs::write(directory.path().join(relative), "preamble!\nneedle!\n").expect("fixture");
+        }
+        let first = lexical_item(directory.path(), "first.txt", 2, "needle!");
+        let second = lexical_item(directory.path(), "second.txt", 2, "needle!");
+        let mut other_coordinates = first.clone();
+        other_coordinates.range =
+            TextRange::from_coordinates(10, 17, 3, 3, 0, 7).expect("different coordinates");
+        let mut shorter = first.clone();
+        shorter.range = TextRange::from_coordinates(10, 16, 2, 2, 0, 6).expect("different end");
+        let mut duplicate = first.clone();
+        duplicate.excerpt_range = Some(shorter.range);
+        let expected = [
+            first.clone(),
+            second.clone(),
+            other_coordinates.clone(),
+            shorter.clone(),
+        ];
+        let actual = super::unique_lexical_matches(vec![
+            first,
+            second.clone(),
+            other_coordinates,
+            duplicate,
+            shorter,
+            second,
+        ])
+        .collect::<Vec<_>>();
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, mut expected)) in actual.into_iter().zip(expected).enumerate() {
+            expected.rank = index + 1;
+            assert_eq!(actual, expected);
+        }
+    }
 
     #[test]
     fn enriches_only_code_and_markdown_structures() {
@@ -410,7 +450,7 @@ mod tests {
             .iter()
             .zip([(first.path(), "First"), (second.path(), "Second")])
         {
-            assert_eq!(item.matched.absolute_path, root.join("section.md"));
+            assert_eq!(item.matched.absolute_path(), root.join("section.md"));
             assert!(matches!(
                 item.container.as_ref().and_then(|container| container.metadata.as_ref()),
                 Some(EntityMetadata::Markdown(MarkdownMetadata { heading: Some(actual), .. }))
@@ -432,15 +472,18 @@ mod tests {
         let items = paths
             .iter()
             .map(|path| {
-                let mut item = template.clone();
-                item.relative_path = path.to_path_buf();
-                item.absolute_path = directory.path().join(path);
-                item
+                LexicalMatch::new(
+                    directory.path().join(path),
+                    path.to_path_buf(),
+                    template.range,
+                    template.content_range,
+                    template.content().to_owned(),
+                )
             })
             .collect::<Vec<_>>();
         assert_eq!(
-            items[0].absolute_path.to_string_lossy(),
-            items[1].absolute_path.to_string_lossy()
+            items[0].absolute_path().to_string_lossy(),
+            items[1].absolute_path().to_string_lossy()
         );
         let result = enrich_lexical_matches_with_structure(
             directory.path(),
@@ -452,8 +495,8 @@ mod tests {
         assert_eq!(result.diagnostics.matched_files, 2);
         // Preserve native paths even when the host cannot create these filenames.
         for (item, path) in result.items.iter().zip(paths) {
-            assert_eq!(item.matched.absolute_path, directory.path().join(path));
-            assert_eq!(item.matched.relative_path, path);
+            assert_eq!(item.matched.absolute_path(), directory.path().join(path));
+            assert_eq!(item.matched.relative_path(), path);
         }
     }
 
@@ -576,7 +619,7 @@ mod tests {
         assert_eq!(enriched.matched.rank, 1);
         assert_eq!(enriched.matched.range, visible_range);
         assert_eq!(enriched.matched.excerpt_range, Some(excerpt));
-        assert_eq!(enriched.matched.content, text.trim_end());
+        assert_eq!(enriched.matched.content(), text.trim_end());
         let container = enriched.container.as_ref().expect("matched function");
         assert!(matches!(
             container.metadata.as_ref(),
@@ -608,15 +651,13 @@ mod tests {
         let range =
             TextRange::from_coordinates(start, start + content.len(), line, line, 0, content.len())
                 .expect("fixture range");
-        LexicalMatch {
-            rank: 0,
-            absolute_path: root.join(relative),
-            relative_path: relative.into(),
+        LexicalMatch::new(
+            root.join(relative),
+            relative.into(),
             range,
-            excerpt_range: None,
-            content_range: range,
-            content: content.to_owned(),
-        }
+            range,
+            content.to_owned(),
+        )
     }
 
     fn item_by_relative_path<'item>(
@@ -625,7 +666,7 @@ mod tests {
     ) -> &'item EnrichedLexicalMatch {
         items
             .iter()
-            .find(|item| item.matched.relative_path == Path::new(path))
+            .find(|item| item.matched.relative_path() == Path::new(path))
             .expect("lexical item")
     }
 }

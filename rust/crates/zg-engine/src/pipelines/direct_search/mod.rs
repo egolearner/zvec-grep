@@ -199,9 +199,18 @@ fn context_from_lexical(
     enrichment: Option<StructureEnrichmentResult>,
     use_entity_ranges: bool,
 ) -> ContextResult {
-    let (items, structure) = match enrichment {
-        Some(enrichment) => (enrichment.items, Some(enrichment.diagnostics)),
-        None => (lexical_matches_without_structure(reply.matches), None),
+    let convert = |item| context_item(item, use_entity_ranges);
+    let (items, structure): (Vec<_>, _) = match enrichment {
+        Some(enrichment) => (
+            enrichment.items.into_iter().map(convert).collect(),
+            Some(enrichment.diagnostics),
+        ),
+        None => (
+            lexical_matches_without_structure(reply.matches)
+                .map(convert)
+                .collect(),
+            None,
+        ),
     };
     let hits_returned = items.len();
     let empty_reason = (hits_returned == 0).then_some({
@@ -225,48 +234,7 @@ fn context_from_lexical(
             LexicalCoverage::Truncated => ContextCoverage::RgTruncated,
         },
         workspace_index: None,
-        items: items
-            .into_iter()
-            .map(
-                |EnrichedLexicalMatch {
-                     matched: item,
-                     container,
-                 }| ContextItem {
-                    kind: ContextItemKind::LexicalMatch,
-                    rank: item.rank,
-                    absolute_path: item.absolute_path,
-                    relative_path: item.relative_path,
-                    range: item.range.into(),
-                    excerpt_range: item.excerpt_range.map(Into::into),
-                    content_range: item.content_range.into(),
-                    content: item.content,
-                    outline: None,
-                    content_role: Some(ContextContentRole::Source),
-                    status: ContextItemStatus::Fresh,
-                    score: None,
-                    matched_by: MatchedBy::Lexical,
-                    metadata: container
-                        .as_ref()
-                        .and_then(|value| value.metadata.as_ref())
-                        .cloned(),
-                    entity_id: None,
-                    container: container.map(|value| ContextContainer {
-                        entity_id: None,
-                        range: if use_entity_ranges {
-                            value.entity_range
-                        } else {
-                            value.range
-                        }
-                        .into(),
-                        metadata: value.metadata,
-                    }),
-                    trace: None,
-                    query_groups: Vec::new(),
-                    selection_reason: None,
-                    coverage_group: None,
-                },
-            )
-            .collect(),
+        items,
         group_results: Vec::new(),
         diagnostics: ContextDiagnostics {
             empty_reason,
@@ -287,11 +255,133 @@ fn context_from_lexical(
     }
 }
 
+fn context_item(enriched: EnrichedLexicalMatch, use_entity_ranges: bool) -> ContextItem {
+    let EnrichedLexicalMatch { matched, container } = enriched;
+    let rank = matched.rank;
+    let range = matched.range.into();
+    let excerpt_range = matched.excerpt_range.map(Into::into);
+    let content_range = matched.content_range.into();
+    let (absolute_path, relative_path, content) = matched.into_paths_and_content();
+    ContextItem {
+        kind: ContextItemKind::LexicalMatch,
+        rank,
+        absolute_path,
+        relative_path,
+        range,
+        excerpt_range,
+        content_range,
+        content,
+        outline: None,
+        content_role: Some(ContextContentRole::Source),
+        status: ContextItemStatus::Fresh,
+        score: None,
+        matched_by: MatchedBy::Lexical,
+        metadata: container
+            .as_ref()
+            .and_then(|value| value.metadata.as_ref())
+            .cloned(),
+        entity_id: None,
+        container: container.map(|value| ContextContainer {
+            entity_id: None,
+            range: if use_entity_ranges {
+                value.entity_range
+            } else {
+                value.range
+            }
+            .into(),
+            metadata: value.metadata,
+        }),
+        trace: None,
+        query_groups: Vec::new(),
+        selection_reason: None,
+        coverage_group: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::api::context::options::{ContextRoute, ContextRouteMode, RgOptions};
 
     use super::{ContextOptions, normalize_request};
+
+    #[tokio::test]
+    async fn shared_source_results_preserve_order_context_and_limits() {
+        use crate::api::context::result::{ContentRange, ContextCoverage};
+
+        let directory = tempfile::tempdir().expect("source directory");
+        let source = "中 needle 一\r\nneedle two\r\n尾 needle";
+        for path in ["a.txt", "z.txt"] {
+            std::fs::write(directory.path().join(path), source).expect("source");
+        }
+        for threads in [1, 2] {
+            for context in [0, 1] {
+                for limit in [None, Some(5)] {
+                    let engine = crate::ZvecGrep::new();
+                    let result = engine
+                        .context(ContextOptions {
+                            root: Some(directory.path().to_path_buf()),
+                            rg: true,
+                            query: Some("needle".into()),
+                            rg_paths: vec!["z.txt".into(), "a.txt".into(), "a.txt".into()],
+                            limit,
+                            rg_options: RgOptions {
+                                threads: Some(threads),
+                                before_context: context,
+                                after_context: context,
+                                ..RgOptions::default()
+                            },
+                            ..ContextOptions::default()
+                        })
+                        .await
+                        .expect("plain results");
+                    engine.close();
+                    let expected = if context == 0 {
+                        ["中 needle 一", "needle two", "尾 needle"]
+                    } else {
+                        [
+                            "中 needle 一\r\nneedle two",
+                            source,
+                            "needle two\r\n尾 needle",
+                        ]
+                    };
+                    assert_eq!(result.items.len(), if limit.is_some() { 3 } else { 6 });
+                    assert_eq!(
+                        result.coverage,
+                        if limit.is_some() {
+                            ContextCoverage::RgTruncated
+                        } else {
+                            ContextCoverage::RgExhaustive
+                        }
+                    );
+                    for (index, item) in result.items.iter().enumerate() {
+                        let path = if index < 3 { "a.txt" } else { "z.txt" };
+                        assert_eq!(item.rank, index + 1);
+                        assert_eq!(item.relative_path, std::path::Path::new(path));
+                        assert_eq!(item.absolute_path, directory.path().join(path));
+                        assert_eq!(item.content, expected[index % 3]);
+                        let ContentRange::Text {
+                            start_byte_offset,
+                            end_byte_offset,
+                            ..
+                        } = item.content_range
+                        else {
+                            panic!("text coordinates")
+                        };
+                        assert_eq!(&source[start_byte_offset..end_byte_offset], item.content);
+                        let ContentRange::Text {
+                            start_byte_offset,
+                            end_byte_offset,
+                            ..
+                        } = item.excerpt_range.as_ref().unwrap_or(&item.range)
+                        else {
+                            panic!("matched coordinates")
+                        };
+                        assert_eq!(&source[*start_byte_offset..*end_byte_offset], "needle");
+                    }
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn plain_rg_preserves_matches_and_context_without_structure() {
