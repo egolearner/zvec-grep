@@ -16,8 +16,6 @@ use crate::{
 
 use crate::lexical::types::LexicalMatch;
 
-pub(crate) const RG_STRUCTURE_ENRICH_FILE_LIMIT: usize = 100;
-
 pub(crate) struct StructureEnrichmentResult {
     pub items: Vec<EnrichedLexicalMatch>,
     pub diagnostics: StructureEnrichmentDiagnostics,
@@ -65,12 +63,7 @@ pub(crate) fn enrich_lexical_matches_with_structure(
     let mut enriched_items = 0;
     let mut enriched_files = HashSet::new();
     let mut enriched = Vec::with_capacity(items.len());
-    let mut seen = HashSet::new();
-    for mut item in items {
-        if !seen.insert(lexical_item_key(&item)) {
-            continue;
-        }
-        item.rank = enriched.len() + 1;
+    for item in unique_lexical_matches(items) {
         let container = if let Some(source) = sources_by_file
             .get(&item.absolute_path)
             .and_then(Option::as_ref)
@@ -108,6 +101,29 @@ pub(crate) fn enrich_lexical_matches_with_structure(
             truncated: matched_count > file_limit,
         },
     }
+}
+
+pub(super) fn lexical_matches_without_structure(
+    items: Vec<LexicalMatch>,
+) -> Vec<EnrichedLexicalMatch> {
+    unique_lexical_matches(items)
+        .map(|matched| EnrichedLexicalMatch {
+            matched,
+            container: None,
+        })
+        .collect()
+}
+
+fn unique_lexical_matches(items: Vec<LexicalMatch>) -> impl Iterator<Item = LexicalMatch> {
+    let mut seen = HashSet::new();
+    items
+        .into_iter()
+        .filter(move |item| seen.insert(lexical_item_key(item)))
+        .enumerate()
+        .map(|(index, mut item)| {
+            item.rank = index + 1;
+            item
+        })
 }
 
 fn unique_lexical_file_paths(items: &[LexicalMatch]) -> Vec<PathBuf> {
@@ -284,9 +300,10 @@ mod tests {
     use crate::lexical::types::LexicalMatch;
 
     use super::{
-        EnrichedLexicalMatch, RG_STRUCTURE_ENRICH_FILE_LIMIT, StructureEnrichmentSource,
-        enrich_lexical_matches_with_structure,
+        EnrichedLexicalMatch, StructureEnrichmentSource, enrich_lexical_matches_with_structure,
     };
+
+    const STRUCTURE_FILE_LIMIT: usize = 100;
 
     #[test]
     fn enriches_only_code_and_markdown_structures() {
@@ -313,7 +330,7 @@ mod tests {
                 lexical_item(directory.path(), "structured.ts", 2, "  return \"hello\";"),
             ],
             None,
-            RG_STRUCTURE_ENRICH_FILE_LIMIT,
+            STRUCTURE_FILE_LIMIT,
         );
 
         let unsupported = item_by_relative_path(&result.items, "unsupported.rb");
@@ -354,7 +371,7 @@ mod tests {
                     "  return \"hello\";",
                 )],
                 None,
-                RG_STRUCTURE_ENRICH_FILE_LIMIT,
+                STRUCTURE_FILE_LIMIT,
             );
             assert_eq!(result.diagnostics.enriched_items, 1, "{}", root.display());
             assert_eq!(result.diagnostics.parsed_files, 1, "{}", root.display());
@@ -384,7 +401,7 @@ mod tests {
             first.path(),
             items.into(),
             None,
-            RG_STRUCTURE_ENRICH_FILE_LIMIT,
+            STRUCTURE_FILE_LIMIT,
         );
         assert_eq!(result.items.len(), 2);
         assert_eq!(result.diagnostics.enriched_files, 2);
@@ -429,7 +446,7 @@ mod tests {
             directory.path(),
             items,
             None,
-            RG_STRUCTURE_ENRICH_FILE_LIMIT,
+            STRUCTURE_FILE_LIMIT,
         );
         assert_eq!(result.items.len(), 2);
         assert_eq!(result.diagnostics.matched_files, 2);
@@ -453,7 +470,7 @@ mod tests {
             directory.path(),
             vec![lexical_item(directory.path(), "section.md", 150, line)],
             None,
-            RG_STRUCTURE_ENRICH_FILE_LIMIT,
+            STRUCTURE_FILE_LIMIT,
         );
         let container = result.items[0]
             .container
@@ -486,7 +503,7 @@ mod tests {
             directory.path(),
             items.clone(),
             None,
-            RG_STRUCTURE_ENRICH_FILE_LIMIT,
+            STRUCTURE_FILE_LIMIT,
         );
         assert_eq!(enriched.diagnostics.parsed_files, 1);
         assert!(matches!(
@@ -501,7 +518,7 @@ mod tests {
             directory.path(),
             items,
             Some(8),
-            RG_STRUCTURE_ENRICH_FILE_LIMIT,
+            STRUCTURE_FILE_LIMIT,
         );
         assert_eq!(skipped.diagnostics.parsed_files, 0);
         assert!(skipped.items[0].container.is_none());
@@ -524,7 +541,7 @@ mod tests {
             directory.path(),
             items.into(),
             None,
-            RG_STRUCTURE_ENRICH_FILE_LIMIT,
+            STRUCTURE_FILE_LIMIT,
         );
         assert_eq!(result.diagnostics.enriched_items, 2);
         for (item, expected) in result.items.iter().zip(["alpha", "beta"]) {
@@ -551,7 +568,7 @@ mod tests {
             directory.path(),
             vec![item.clone(), item],
             None,
-            RG_STRUCTURE_ENRICH_FILE_LIMIT,
+            STRUCTURE_FILE_LIMIT,
         );
 
         assert_eq!(result.items.len(), 1);
