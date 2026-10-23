@@ -337,6 +337,16 @@ test("explicit prebuilt mode selects CUDA without probing nvcc and still honors 
   }
 });
 
+test("Windows ARM64 publishing requires its CPU SDK without source compiler overrides", async () => {
+  const entry = selectPlatform(manifest, "win32", "arm64");
+  assert.equal(resolveBuildVariant(entry, false,
+    () => { throw new Error("Windows ARM64 must not probe nvcc"); }, "prebuilt"), "cpu");
+  const workflow = await readFile(new URL("../../.github/workflows/rust-package-build.yml", import.meta.url), "utf8");
+  assert.match(workflow, /^  LLAMA_CPP_BUILD_MODE: prebuilt$/m);
+  assert.doesNotMatch(workflow,
+    /["'](?:CC|CXX|CXXFLAGS|CMAKE_GENERATOR|CMAKE_C_COMPILER_TARGET|CMAKE_CXX_COMPILER_TARGET)=/);
+});
+
 test("CUDA fallback uses the primary Cargo source record, including cached builds and overrides", async (t) => {
   // Exercise real Cargo build-script metadata without compiling CUDA or
   // downloading llama.cpp. Kernel compilation/inference stays in native CI.

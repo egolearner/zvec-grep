@@ -481,10 +481,10 @@ bash scripts/check.sh
 ## Native and CUDA builds
 
 The safe llama API and the C5 FFI boundary share the same pinned
-`zvec-ai/llama-cpp-rs` revision (`0e2d4b520af769de221c1bf98bbbf1b2accf4ddc`).
+`zvec-ai/llama-cpp-rs` revision (`3db3eee8345dca30726c5b0294b313fe824e48e1`).
 Its sys crate automatically selects a SHA256-pinned SDK when target, features
-and native options match: `zvec-0.1.154-cpu-r1` for CPU-only Linux/Windows x64,
-and `zvec-0.1.154-r1` for the existing five release configurations, including
+and native options match: `zvec-0.1.154-cpu-r2` for CPU-only Linux x64 and
+Windows x64/ARM64, and `zvec-0.1.154-r2` for the existing five release configurations, including
 CUDA-enabled Linux/Windows x64. Matching builds reuse native
 libraries and bindings without executing bindgen, CMake, C++ or CUDA compilation;
 Rust application code still compiles normally. CPU-only x64 builds download only
@@ -559,15 +559,15 @@ Source-mode CUDA 12.4 on Windows requires MSVC 14.38 before running
 `scripts/cuda/build-fallback.py`. Matching SDK builds copy that plugin directly,
 so neither a second CMake build nor the fallback toolchain is needed.
 
-Publish CI requires prebuilt llama SDKs on the five existing targets; Windows
-ARM64 builds llama from source until a pinned SDK is available. CUDA Rust CI also requires
+Publish CI requires prebuilt llama SDKs on all six targets, including the
+Windows ARM64 static CPU SDK. CUDA Rust CI also requires
 prebuilt mode instead of recompiling only for its T4 GPU. Linux publish builds
 run on Ubuntu 24.04 without a CUDA compiler. Runtime libraries, driver checks,
 link audits and real CPU/GPU inference gates remain required. Runtime staging
 reads the current Cargo invocation's `GGML_BACKENDS_DIR`, not the newest directory
 under `target/build`; only runtime libraries, not SDK import archives or bindings,
 are packaged. CUDA 13.1 distribution builds use
-`75-real;80-real;86-real;89-real;90-real;90-virtual`. The CUDA 12.4 fallback uses
+`75-virtual;80-virtual;86-real;89-real;90-virtual;120a-real;121a-real`. The CUDA 12.4 fallback uses
 `50-virtual;61-virtual;70-virtual;75-virtual;80-virtual;86-real` to reduce its
 size, retaining PTX for driver JIT compilation where compatible native code is
 unavailable. Override `CMAKE_CUDA_ARCHITECTURES` for the primary backend or
@@ -870,9 +870,9 @@ Windows ARM64 builds and tests natively on `windows-11-arm` with ARM64 Node,
 Rust, and MSVC. zvec-rust 0.8.0 automatically downloads its Windows ARM64
 prebuilt SDK and stages `zvec_c_api.dll` for packaging; no local zvec source
 build is needed. ONNX Runtime uses the SHA-256-verified ARM64 DirectML archive
-from the locked dependency's distribution manifest. The pinned llama SDK does
-not yet cover Windows ARM64, so its model runtime builds from source with
-Clang's MSVC-compatible `clang-cl` frontend and Ninja. npm selects
+from the locked dependency's distribution manifest. llama-cpp-rs selects the
+SHA-256-pinned Windows ARM64 static CPU SDK from `zvec-0.1.154-cpu-r2`, without
+running bindgen, CMake or a C++ compiler. No Clang/Ninja overrides are needed. npm selects
 `@zvec/zvec-grep-win32-arm64-msvc` for ARM64 Node on Windows.
 
 For a complete all-platform run, download the `rust-release-<version>` artifact

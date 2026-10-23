@@ -1667,7 +1667,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 [[package]]
 name = "llama-cpp-2"
 version = "0.1.154"
-source = "git+https://github.com/zvec-ai/llama-cpp-rs.git?rev=0e2d4b520af769de221c1bf98bbbf1b2accf4ddc#0e2d4b520af769de221c1bf98bbbf1b2accf4ddc"
+source = "git+https://github.com/zvec-ai/llama-cpp-rs.git?rev=3db3eee8345dca30726c5b0294b313fe824e48e1#3db3eee8345dca30726c5b0294b313fe824e48e1"
 dependencies = [
  "encoding_rs",
  "enumflags2",
@@ -1680,7 +1680,7 @@ dependencies = [
 [[package]]
 name = "llama-cpp-sys-2"
 version = "0.1.154"
-source = "git+https://github.com/zvec-ai/llama-cpp-rs.git?rev=0e2d4b520af769de221c1bf98bbbf1b2accf4ddc#0e2d4b520af769de221c1bf98bbbf1b2accf4ddc"
+source = "git+https://github.com/zvec-ai/llama-cpp-rs.git?rev=3db3eee8345dca30726c5b0294b313fe824e48e1#3db3eee8345dca30726c5b0294b313fe824e48e1"
 dependencies = [
  "bindgen",
  "cc",
