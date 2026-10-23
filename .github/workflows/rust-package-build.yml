@@ -69,7 +69,8 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: ${{ inputs.target == 'win32-arm64-msvc' && 'arm64' || 'x64' }}
-          vsversion: "2022"
+          # ARM64 follows the runner image's installed Visual Studio version.
+          vsversion: ${{ inputs.target == 'win32-x64-msvc' && '2022' || '' }}
       - name: Install Linux build dependencies
         if: runner.os == 'Linux' && inputs.target != 'linux-x64-gnu'
         run: |
