@@ -238,9 +238,9 @@ The workflow runs only through manual dispatch and does not publish unless
 individually.
 `publish=true` requires `platform=all`; a subset is a validation-only candidate,
 not a complete release. Manual runs with `publish=false, cuda=false` use ordinary CPU runners;
-they do not allocate GPUs or publish packages. The five existing package builds require
-the pinned llama-cpp-rs prebuilt SDK; Windows ARM64 builds llama from source
-until a matching SDK is available. Linux/Windows x64 still produce CUDA-capable
+they do not allocate GPUs or publish packages. All six package builds require
+the pinned llama-cpp-rs prebuilt SDK, including the Windows ARM64 static CPU
+SDK. Linux/Windows x64 still produce CUDA-capable
 bundles, but neither the 13.1 primary nor 12.4 fallback is compiled in zg CI.
 All packaging builds stay on ordinary CPU runners, including when `cuda=true`
 or `publish=true`. Manual `cuda=true` runs add separate Linux/Windows x64 GPU
@@ -263,10 +263,11 @@ zvec-rust 0.8.0's automatically selected Windows ARM64 prebuilt SDK instead of
 building zvec from source. The shared DLL is staged by zvec-rust-build and
 bundled in `@zvec/zvec-grep-win32-arm64-msvc`. ONNX Runtime uses the locked
 ARM64 DirectML distribution with SHA-256 verification and a separate cache.
-The llama model runtime uses `clang-cl` and Ninja because ggml's ARM CPU
-backend requires Clang inline assembly and no pinned Windows ARM64 llama SDK
-is available yet. The installed artifacts receive the same CLI, managed-rg,
-and direct/server daemon IPC checks as the other non-CUDA targets.
+llama-cpp-rs selects the SHA-256-pinned Windows ARM64 static CPU SDK from
+`zvec-0.1.154-cpu-r2`, without running bindgen, CMake, or a C++ compiler.
+No Clang/Ninja overrides are needed during packaging. The installed artifacts
+receive the same CLI, managed-rg, and direct/server daemon IPC checks as the
+other non-CUDA targets.
 
 Build jobs select Cargo/CMake parallelism from the runner's available CPUs and
 total memory, budgeting 3 GiB per job and capping concurrency at 8. The Linux
