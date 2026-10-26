@@ -1,0 +1,199 @@
+name: Ubuntu 22.04 artifact compatibility
+run-name: Ubuntu 22.04 compatibility · source run 40257684673
+
+on:
+  push:
+    branches: [verify/ubuntu22-40257684673]
+    paths: [.github/workflows/ubuntu22-artifact-compatibility.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  compatibility:
+    name: Ubuntu 22.04 (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64-gnu
+            runner: ubuntu-22.04
+          - target: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out the exact artifact source
+        uses: actions/checkout@v6
+        with:
+          repository: zvec-ai/zvec-grep
+          ref: 3ee5cbe345e71fae6b804ea227efd02e34a6d124
+          path: source
+          persist-credentials: false
+      - name: Install the packaging runtime
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Download the original platform artifacts
+        uses: actions/download-artifact@v8
+        with:
+          repository: zvec-ai/zvec-grep
+          run-id: 40257684673
+          github-token: ${{ github.token }}
+          name: rust-native-${{ matrix.target }}
+          path: artifacts
+      - name: Download the original release inventory and meta package
+        uses: actions/download-artifact@v8
+        with:
+          repository: zvec-ai/zvec-grep
+          run-id: 40257684673
+          github-token: ${{ github.token }}
+          name: rust-verification-0.0.1
+          path: artifacts
+      - name: Prepare the compatibility probe
+        shell: bash
+        run: |
+          mkdir -p results
+          cat > probe.py <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          root = Path("/results")
+          report = {
+              "source_repository": "zvec-ai/zvec-grep",
+              "source_run": 40257684673,
+              "source_commit": "3ee5cbe345e71fae6b804ea227efd02e34a6d124",
+              "target": os.environ["TARGET"],
+              "os_release": Path("/etc/os-release").read_text(),
+              "glibc": subprocess.check_output(["getconf", "GNU_LIBC_VERSION"], text=True).strip(),
+              "checks": [],
+          }
+
+          def run(name, args, timeout=300):
+              try:
+                  result = subprocess.run(args, cwd="/source/rust", text=True,
+                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                          timeout=timeout)
+                  output, code = result.stdout, result.returncode
+              except subprocess.TimeoutExpired as error:
+                  output = str(error.stdout or "") + "\nTimed out"
+                  code = 124
+              (root / (name + ".log")).write_text(output)
+              report["checks"].append({"name": name, "exit_code": code})
+              print(f"=== {name}: exit {code} ===\n{output}", flush=True)
+              return code
+
+          inventory = json.loads(Path("/artifacts/release.json").read_text())
+          assert inventory["commit"] == report["source_commit"], "Release inventory commit mismatch"
+          assert inventory["version"] == "0.0.1", "Release inventory version mismatch"
+          install = run("npm-install", [
+              "node", "scripts/npm-release.mjs", "install-artifacts",
+              "--target", os.environ["TARGET"], "--tarball-dir", "/artifacts",
+              "--prefix-root", "/results/install", "--accelerator", "cpu",
+          ])
+          bundle = root / "install/prefix/lib/node_modules/@zvec/zvec-grep"
+          binary = bundle / "bin/zg.exe"
+          if install == 0 and binary.is_file():
+              audit = []
+              for file in sorted(bundle.rglob("*")):
+                  if not file.is_file():
+                      continue
+                  with file.open("rb") as source:
+                      if source.read(4) != b"\x7fELF":
+                          continue
+                  versions = subprocess.run(["readelf", "--version-info", str(file)],
+                                            capture_output=True, text=True).stdout
+                  required = {}
+                  for family in ("GLIBC", "GLIBCXX", "CXXABI"):
+                      values = set(re.findall(r"Name: (" + family + r"_[0-9.]+)", versions))
+                      if values:
+                          required[family] = max(values, key=lambda value: tuple(
+                              map(int, value.split("_", 1)[1].split("."))))
+                  loaded = subprocess.run(["ldd", str(file)], capture_output=True, text=True)
+                  audit.append({"file": str(file.relative_to(bundle)), "max_required": required,
+                                "ldd_exit": loaded.returncode,
+                                "ldd": loaded.stdout + loaded.stderr})
+              report["elf_audit"] = audit
+              (root / "elf-audit.json").write_text(json.dumps(audit, indent=2))
+              print(json.dumps(audit, indent=2), flush=True)
+              startup = run("version", [str(binary), "--version"])
+              run("help", [str(binary), "--help"])
+              if startup == 0:
+                  smoke = run("direct-and-server-smoke", [
+                      "node", "--input-type=module", "-e",
+                      'import {loadReleaseManifest,platformByTarget} from "./scripts/npm-package-core.mjs";'
+                      'import {smokeInstalledPackage} from "./scripts/npm-release-smoke.mjs";'
+                      'const manifest=loadReleaseManifest();'
+                      'await smokeInstalledPackage({manifest,entry:platformByTarget(manifest,process.env.TARGET),'
+                      'version:"0.0.1",prefix:"/results/install/prefix",fixtureRoot:"/results/smoke"});'
+                  ])
+                  if smoke == 0:
+                      run("gguf-and-onnx-cpu-inference", [
+                          "python3", "scripts/cuda/e2e.py", "--cpu-only",
+                          "--bundle", str(bundle), "--model-cache", "/model-cache",
+                          "--logs", "/results/model-logs",
+                      ], timeout=1200)
+              else:
+                  report["skipped"] = "Functional and model checks skipped because the original binary cannot start."
+          report["compatible"] = bool(report["checks"]) and all(
+              check["exit_code"] == 0 for check in report["checks"])
+          (root / "report.json").write_text(json.dumps(report, indent=2))
+          print(json.dumps(report, indent=2), flush=True)
+          sys.exit(0 if report["compatible"] else 1)
+          PY
+      - name: Verify in a clean Ubuntu 22.04 userspace
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          node_root="$(node -p 'require("node:path").dirname(require("node:path").dirname(process.execPath))')"
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}/source:/source:ro" \
+            --volume "${GITHUB_WORKSPACE}/artifacts:/artifacts:ro" \
+            --volume "${GITHUB_WORKSPACE}/probe.py:/probe.py:ro" \
+            --volume "${GITHUB_WORKSPACE}/results:/results" \
+            --volume "${node_root}:/opt/node:ro" \
+            --env TARGET --env DEBIAN_FRONTEND=noninteractive \
+            --env PATH=/opt/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            ubuntu:22.04 bash -euo pipefail -c '
+              apt-get update -qq
+              apt-get install --yes --no-install-recommends python3 ca-certificates libstdc++6 binutils >/dev/null
+              python3 /probe.py
+            '
+      - name: Publish the compatibility summary
+        if: always()
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          report = Path("results/report.json")
+          if report.is_file():
+              data = json.loads(report.read_text())
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+                  output.write(f"## Ubuntu 22.04: {data['target']}\n\n")
+                  output.write(f"Source run: [40257684673](https://github.com/zvec-ai/zvec-grep/actions/runs/40257684673)\n\n")
+                  output.write(f"Runtime: {data['glibc']}\n\n")
+                  output.write(f"Compatible: **{data['compatible']}**\n\n")
+                  for check in data["checks"]:
+                      output.write(f"- {check['name']}: exit {check['exit_code']}\n")
+                  if data.get("skipped"):
+                      output.write("\n" + data["skipped"] + "\n")
+      - name: Retain logs and ELF evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ubuntu22-evidence-${{ matrix.target }}
+          path: |
+            results/*.json
+            results/*.log
+            results/model-logs/
+            results/install/installation.json
+          if-no-files-found: warn
+          retention-days: 14
