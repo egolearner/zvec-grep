@@ -8,6 +8,13 @@ names and npm `os`, `cpu`, and `libc` selectors.
 The current published targets are macOS ARM64/x64, Linux x64/ARM64 with glibc,
 and Windows x64/ARM64.
 
+After native installation succeeds, eligible per-user global installs run
+`zg --install --upgrade-installed` using the installed binary's absolute path.
+This migrates existing 0.2.x agent launchers without adding integrations or
+starting a daemon. See the [package README](meta/README.md) for skip conditions,
+`ZG_INSTALL_SKIP_AGENT_UPGRADE`, backups and manual recovery. Release verification
+sets the skip flag so temporary npm prefixes never change user configuration.
+
 After installation, the meta package retains the existing runtime paths. CUDA
 files are present only after successful plugin installation:
 
@@ -20,9 +27,9 @@ lib/*ggml-cuda*          # primary CUDA 13.1 GGUF plugin
 lib/cuda12/*ggml-cuda*    # CUDA 12.4 GGUF fallback plugin
 ```
 
-Source npm packages also carry `checksums.json` and, once reviewed inputs are
-available, `LICENSES/` and `SBOM.spdx.json`; these are package metadata rather
-than runtime files copied by the installer.
+Every release package carries the project's `LICENSE`. Native packages also
+carry `checksums.json` and any supplied `LICENSES/` or `SBOM.spdx.json`; these
+are package metadata rather than runtime files copied by the installer.
 
 The Linux x64 base package's `plugins.json` references `-ggml-cuda13`, `-ggml-cuda12`,
 `-ort-cuda-part1` and `-ort-cuda-part2` packages. Windows x64 references
@@ -72,8 +79,9 @@ publication path and 64-bit Node's string limit. `npm pack` succeeding alone is
 not publication validation. A component that outgrows the budget fails closed;
 it must be split further, not silently published as a reduced CPU package.
 
-`LICENSES/` and `SBOM.spdx.json` require reviewed per-target compliance inputs;
-validation candidates may omit them, but publication and promotion may not.
+Supplemental `LICENSES/` and `SBOM.spdx.json` inputs are optional for packaging,
+publication, and promotion. Existing upstream license and notice files remain
+bundled with their native libraries and redistributed ORT components.
 
 `bin/` contains only the native executable. All runtime libraries, providers,
 and plugins live under `lib/`. Unix binaries use a `../lib`
@@ -82,12 +90,12 @@ executable's sibling `lib/`. The binary runs directly, without a JavaScript
 launcher or custom loader environment variables for bundled libraries. Host
 NVIDIA libraries must still be discoverable by the system loader.
 
-Non-CUDA builds enable ORT's upstream `copy-dylibs` feature to stage runtime
-sidecars beside the Cargo executable. npm packaging copies them into `lib/`
-as regular files, including any symlinked libraries. This includes Intel macOS's
-dynamically linked ORT and Windows DirectML's DLL; it does not change the static
-ORT linkage used by the default macOS ARM64 and Linux CPU builds. CUDA bundles
-load ORT dynamically and continue to stage their pinned core/providers explicitly.
+All six targets dynamically load official ORT 1.21.0. The engine build script
+stages verified libraries beside Cargo executables, tests and examples; npm
+copies them and their upstream notices into `lib/`. No target downloads Pyke
+static ORT archives or compiles ORT from source. CPU-only Windows uses the
+DirectML NuGet runtime and its pinned DirectML DLL; CUDA x64 bundles use the
+matching official CPU core/shared provider/CUDA provider from one distribution.
 
 The default `linux-x64-gnu` and `win32-x64-msvc` native packages are CPU/CUDA
 bundles. CUDA libraries remain runtime plugins: compatible NVIDIA libraries
@@ -120,13 +128,13 @@ Published target/backend support is:
 | --- | --- | --- |
 | macOS ARM64 | CPU + Metal | CPU (CoreML deliberately not selected) |
 | macOS x64 (14+) | CPU + Metal where available | CPU (CoreML deliberately not selected) |
-| Linux x64 glibc (Ubuntu 24.04 baseline) | CPU + CUDA 13.1, CUDA 12.4 fallback | CPU + CUDA 12 |
-| Linux ARM64 glibc | CPU | CPU |
+| Linux x64 glibc (Ubuntu 20.04 / glibc 2.31 baseline) | CPU + CUDA 13.1, CUDA 12.4 fallback | CPU + CUDA 12 |
+| Linux ARM64 glibc (Ubuntu 20.04 / glibc 2.31 baseline) | CPU | CPU |
 | Windows x64 | CPU + CUDA 13.1, CUDA 12.4 fallback | CPU + CUDA 12 |
 | Windows ARM64 | CPU | CPU + DirectML |
 
 A deliberate CPU-only Windows build retains DirectML. The published Windows
-CUDA bundle uses the official ONNX Runtime 1.28.0 CUDA 12 provider and does not
+CUDA bundle uses the official ONNX Runtime 1.21.0 CUDA 12 provider and does not
 claim DirectML support. ORT requires CUDA 12 runtime/cuBLAS and cuDNN 9 even
 when GGUF uses CUDA 13; the two runtime families can coexist. NVIDIA driver,
 CUDA runtime, cuBLAS and cuDNN remain host dependencies, not bundled libraries.
@@ -215,7 +223,8 @@ Release order:
 1. Build and package every native target; apply ad hoc signatures on macOS.
 2. Collect the exact-version meta/native/component candidates once. Verify
    payload closure and checksums, run CPU and requested GPU checks in parallel,
-   and require all publication gates including licenses and SBOMs to pass.
+   and require all publication gates to pass. Supplemental licenses and SBOMs
+   are optional.
 3. Publish runtime components before their base native packages to `rust-canary`, then publish the meta package
    to `rust-canary` last. Candidate publication never changes `latest`.
 4. On every platform's ordinary CPU runner, install the exact meta-package version from the
@@ -253,16 +262,15 @@ CPU checks or remove the candidate, but blocks npm publication.
 Runs use branch-plus-platform concurrency groups, allowing different platform
 selections on the same branch to run concurrently without cancelling an
 in-progress run in the same group.
-Intel macOS no longer gates the other platform builds. Its ONNX Runtime with
-CoreML and zvec SDK are built from
-pinned sources, cached, and bundled with the native package. The Intel release
-targets macOS 14 and later.
+Intel macOS uses the official precompiled ORT 1.21.0 dylib. ORT is not built
+from source on any published target. The Intel release targets macOS 14 and later.
 
 Windows ARM64 uses `windows-11-arm` with ARM64 Node, Rust, and MSVC. It uses
 zvec-rust 0.8.0's automatically selected Windows ARM64 prebuilt SDK instead of
 building zvec from source. The shared DLL is staged by zvec-rust-build and
-bundled in `@zvec/zvec-grep-win32-arm64-msvc`. ONNX Runtime uses the locked
-ARM64 DirectML distribution with SHA-256 verification and a separate cache.
+bundled in `@zvec/zvec-grep-win32-arm64-msvc`. ONNX Runtime uses the official
+ARM64 DirectML 1.21.0 NuGet runtime and Microsoft.AI.DirectML 1.15.4, with
+SHA-256 verification and a separate archive cache.
 llama-cpp-rs selects the SHA-256-pinned Windows ARM64 static CPU SDK from
 `zvec-0.1.154-cpu-r2`, without running bindgen, CMake, or a C++ compiler.
 No Clang/Ninja overrides are needed during packaging. The installed artifacts
@@ -277,7 +285,7 @@ both CUDA plugins; no Windows CUDA compiler/MSVC 14.38 fallback setup or second
 Linux CUDA builder is needed. Rust linking and dependency audits remain. The SDK
 cache is keyed separately from Cargo build output and checked by the fork's
 embedded archive/manifest hashes. Native configuration drift fails release CI
-instead of silently rebuilding. ORT and zvec build/download behavior is unchanged.
+instead of silently rebuilding. ORT uses the common pinned-runtime preparer; zvec SDK selection is unchanged.
 Linux x64 mounts the restored Cargo registry and Git caches into its Docker
 builder and returns ownership to the runner before saving them. The host skips
 compiler-library/CMake installation; pinned Rust remains for packaging's
@@ -355,11 +363,11 @@ published first and the meta package last, always under `rust-canary`. Selecting
 `latest` requests the separate promotion job; any registry smoke failure leaves
 the existing default installation unchanged.
 
-Publication is currently blocked until reviewed license texts and SPDX SBOMs
-exist for every native target under [`compliance/`](compliance/README.md).
-Candidate artifacts can still be downloaded, but they are not publication-ready
-while these inputs are missing. Both the initial source check and the tarball
-preflight fail before publication when compliance inputs are incomplete.
+Publication and promotion do not require supplemental license collections or
+SPDX SBOMs under [`compliance/`](compliance/README.md). Packaging copies either
+input when supplied, without validating the SBOM schema. Every release package
+includes the project `LICENSE`, and bundled upstream notices are preserved.
+Removing this metadata gate does not change third-party redistribution terms.
 
 Publication and promotion explicitly install npm 11.21.0, which supports OIDC
 authentication for `npm dist-tag`. Configure trusted publishing for all 14

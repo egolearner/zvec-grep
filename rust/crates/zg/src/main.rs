@@ -72,9 +72,17 @@ fn run() -> Result<ExitCode, Box<dyn Error>> {
             writeln!(zg_cli::stdout(), "{}", env!("CARGO_PKG_VERSION"))?;
             return Ok(ExitCode::SUCCESS);
         }
+        CliPlan::Install(args) if args.upgrade_installed => {
+            zg_cli::execute_upgrade_installed(args)?;
+            return Ok(ExitCode::SUCCESS);
+        }
         _ => {}
     }
-    install_darwin_metal_residency_mitigation()?;
+    let lexical_only = matches!(&plan, CliPlan::Files { .. })
+        || matches!(&plan, CliPlan::Query { request, .. } if request.rg);
+    if !lexical_only {
+        install_darwin_metal_residency_mitigation()?;
+    }
     // Emit after a possible re-exec so macOS prints each warning only once.
     warn();
     if let Some(warning) = positional_warning {
@@ -90,7 +98,12 @@ fn run() -> Result<ExitCode, Box<dyn Error>> {
         init_tracing(debug);
     }
 
-    let runtime = Builder::new_multi_thread().enable_all().build()?;
+    // The grep walker owns its search threads; a Tokio worker pool would duplicate them.
+    let runtime = if lexical_only {
+        Builder::new_current_thread().enable_all().build()?
+    } else {
+        Builder::new_multi_thread().enable_all().build()?
+    };
 
     runtime.block_on(Box::pin(execute_plan(plan)))
 }
@@ -568,15 +581,15 @@ async fn select_query_index(
                 endpoint: None,
                 device: zg_engine::api::index::options::Device::Auto,
             }),
-            // Remote credentials are only forwarded after an explicit model selection.
-            api_key: if model.local {
+            // Query credentials remain temporary during the implicit build.
+            runtime_api_key: if model.local {
                 None
             } else {
                 request.api_key.clone()
             },
             allow_remote: request.allow_remote,
-            device: if model.local { request.device } else { None },
-            model_cache: request.model_cache.clone(),
+            runtime_device: if model.local { request.device } else { None },
+            runtime_model_cache: request.model_cache.clone(),
             embedding_concurrency: request.embedding_concurrency,
             lock_timeout_ms: request.lock_timeout_ms,
             ..IndexOptions::default()
@@ -616,7 +629,7 @@ async fn select_query_index(
             )
             .into());
         }
-        request.device = index_request.device;
+        request.device = index_request.runtime_device;
         request
             .authorized_remote
             .extend(index_request.authorized_remote.clone());
@@ -768,12 +781,14 @@ async fn execute_direct_context(
             .and_then(zg_engine::api::context::result::ContextIndexingStatus::from_stats);
     }
     engine.close();
+    let mut stdout = io::BufWriter::new(zg_cli::stdout());
     zg_cli::write_context_with_options(
-        zg_cli::stdout(),
+        &mut stdout,
         &result,
         output,
         zg_cli::stdout_supports_ansi(),
     )?;
+    stdout.flush()?;
     zg_cli::write_context_status(io::stderr().lock(), &result)?;
     if output.debug {
         eprintln!(
@@ -1163,14 +1178,13 @@ mod query_authorization_tests {
     async fn query_choices_apply_to_execution_and_workspace_consent_is_reused() {
         const FIXTURE_ENV: &str = "ZG_QUERY_AUTHORIZATION_TEST_ROOT";
         let Some(root) = std::env::var_os(FIXTURE_ENV) else {
-            // Isolate signing and global configuration without mutating process environment.
+            // Isolate global configuration without mutating process environment.
             let workspace = tempfile::tempdir().expect("workspace");
             let state = tempfile::tempdir().expect("state");
             let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
                 .args(["--exact", "query_authorization_tests::query_choices_apply_to_execution_and_workspace_consent_is_reused", "--nocapture"])
                 .env(FIXTURE_ENV, workspace.path())
                 .env("HOME", state.path()).env("USERPROFILE", state.path())
-                .env("ZVEC_GREP_AUTHORIZATION_KEY_FILE", state.path().join("key"))
                 .env_remove("ZVEC_GREP_API_KEY").env_remove("ZVEC_GREP_ENDPOINT")
                 .env_remove("ZVEC_GREP_EMBEDDING").env_remove("DASHSCOPE_API_KEY").env_remove("QWEN_API_KEY")
                 .output().expect("isolated test");
