@@ -121,7 +121,7 @@ export async function smokeStandalone({ directory, prefixRoot, expectCuda = fals
     const before = await instance();
     const upgradeOutput = await install({ ...(expectCuda ? { accelerator: "auto" } : {}), onPath: true });
     assert.doesNotMatch(upgradeOutput, /not in your current PATH/);
-    assert.notEqual((await instance()).pid, before.pid, "upgrade must replace the old daemon");
+    assert.notEqual((await instance()).instanceToken, before.instanceToken, "upgrade must replace the old daemon");
     receipt = JSON.parse(await readFile(join(installDir, "current/install-receipt.json"), "utf8"));
     assert.equal(receipt.acceleratorActual, expectCuda ? "cuda" : "cpu");
     assert.equal(receipt.source, "https://github.com/zvec-ai/zvec-grep/releases");
@@ -135,7 +135,7 @@ export async function smokeStandalone({ directory, prefixRoot, expectCuda = fals
     corrupt = true;
     await assert.rejects(install(), /Command failed/);
     corrupt = false;
-    assert.equal((await instance()).pid, active.pid, "download failure must leave the running version intact");
+    assert.equal((await instance()).instanceToken, active.instanceToken, "download failure must leave the running version intact");
     assert.equal(await readFile(data, "utf8"), "preserve configuration and indexes");
     const pinnedOutput = await install({ version: inventory.version, shell: "/usr/bin/fish" });
     if (process.platform !== "win32") assert.match(pinnedOutput, /fish_add_path "\$HOME\/\.local\/bin"/);

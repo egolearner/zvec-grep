@@ -162,12 +162,20 @@ impl Fixture {
         }
     }
 
+    fn instance(&self) -> Value {
+        serde_json::from_slice(&fs::read(self.home.join("daemon/instance.lock")).expect("instance"))
+            .expect("record")
+    }
+
     fn pid(&self) -> u64 {
-        let record: Value = serde_json::from_slice(
-            &fs::read(self.home.join("daemon/instance.lock")).expect("instance"),
-        )
-        .expect("record");
-        record["pid"].as_u64().expect("PID")
+        self.instance()["pid"].as_u64().expect("PID")
+    }
+
+    fn instance_token(&self) -> String {
+        self.instance()["instanceToken"]
+            .as_str()
+            .expect("instance token")
+            .to_owned()
     }
 }
 
@@ -247,10 +255,11 @@ fn standalone_upgrade_restarts_owned_daemon_preserves_data_and_recovers_interrup
             .output()
             .expect("start"),
     );
-    let first_pid = fixture.pid();
+    let first_instance = fixture.instance_token();
     fixture.write_manifest("second");
     success(fixture.install());
-    assert_ne!(fixture.pid(), first_pid);
+    // Windows may reuse a PID immediately; the instance token identifies each daemon lifetime.
+    assert_ne!(fixture.instance_token(), first_instance);
     assert_eq!(
         fs::read_to_string(fixture.install.join("previous/marker")).expect("previous"),
         "first"
