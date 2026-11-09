@@ -182,6 +182,17 @@ impl Fixture {
         }
     }
 
+    fn normalized_launcher(&self) -> PathBuf {
+        let launcher = self.launcher();
+        // Resolve directory aliases without following the stable command symlink itself.
+        launcher
+            .parent()
+            .expect("launcher directory")
+            .canonicalize()
+            .expect("canonical launcher directory")
+            .join(launcher.file_name().expect("launcher filename"))
+    }
+
     fn instance(&self) -> Value {
         serde_json::from_slice(&fs::read(self.home.join("daemon/instance.lock")).expect("instance"))
             .expect("record")
@@ -231,11 +242,7 @@ impl Fixture {
     }
 
     fn assert_agent_migrated(&self, mut original: Value) {
-        let launcher = if cfg!(windows) {
-            self.launcher().canonicalize().expect("absolute executable")
-        } else {
-            self.launcher()
-        };
+        let launcher = self.normalized_launcher();
         original["mcpServers"]["zvec_grep"]["command"] = json!(launcher);
         original["mcpServers"]["native"]["command"] = json!(launcher);
         original["mcpServers"]["zvec_grep"]["args"] = json!(["--server", "--stdio"]);
@@ -267,7 +274,7 @@ impl Fixture {
             .find(|line| line.contains("3. Stop the external daemon"))
             .expect("manual stop command");
         assert!(
-            stop.contains(self.launcher().to_string_lossy().as_ref()),
+            stop.contains(self.normalized_launcher().to_string_lossy().as_ref()),
             "{stop}"
         );
         assert!(
@@ -281,7 +288,13 @@ impl Fixture {
             "{stdout}"
         );
         assert!(
-            stdout.contains(self.home.to_string_lossy().as_ref()),
+            stdout.contains(
+                self.home
+                    .canonicalize()
+                    .expect("canonical home")
+                    .to_string_lossy()
+                    .as_ref()
+            ),
             "{stdout}"
         );
     }

@@ -85,16 +85,15 @@ case "$os" in
         if [ "$arch" = x64 ]; then
             major=$(sw_vers -productVersion | cut -d . -f 1)
             [ "$major" -ge 14 ] || fail "Intel macOS requires version 14 or newer"
-        fi
-        temp_base=${ZG_INSTALL_TMPDIR:-"$HOME/tmp"} ;;
+        fi ;;
     Linux)
         libc=$(getconf GNU_LIBC_VERSION 2>/dev/null || :)
         case "$libc" in 'glibc '*) ;; *) fail "Linux requires glibc; musl is not supported" ;; esac
         printf '%s\n' "$libc" | awk '{split($2,v,"."); exit !(v[1]>2 || (v[1]==2 && v[2]>=31))}' || fail "glibc 2.31 or newer is required"
-        target="linux-$arch-gnu"
-        temp_base=${ZG_INSTALL_TMPDIR:-${TMPDIR:-/tmp}} ;;
+        target="linux-$arch-gnu" ;;
     *) fail "unsupported OS: $os; use install.ps1 on Windows" ;;
 esac
+temp_base=${ZG_INSTALL_TMPDIR:-${TMPDIR:-/tmp}}
 mkdir -p "$temp_base"
 staging=$(mktemp -d "$temp_base/zg-install.XXXXXXXX")
 trap 'rm -rf "$staging"' EXIT

@@ -56,6 +56,9 @@ PATH preference persist across upgrades. A custom directory must be passed again
 directories to discover installations. Initial installation into an unrelated,
 nonempty directory is rejected.
 
+Temporary downloads use `TMPDIR` on Unix (falling back to `/tmp`) and the system
+temporary directory on Windows. `ZG_INSTALL_TMPDIR` overrides either location.
+
 To test a fork, set `ZG_INSTALL_REPOSITORY=owner/repository`. Only GitHub Releases
 are supported; the repository is recorded and reused on subsequent installs.
 Download the installer from that same repository and use `--version`/`-Version`
