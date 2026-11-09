@@ -153,9 +153,13 @@ pending.json           # Recovery journal, including command-link state
 The binary invoked from staging performs the transaction on both OS families.
 It copies and verifies the new bundle before taking the local daemon startup
 claim, then gracefully stops only a process whose executable belongs to this
-installation. Other installations sharing that daemon home cause an explicit
-error; stop them yourself before switching channels. Remote servers are not
-controlled by the installer. A protected daemon needs its existing token.
+installation. A daemon from another installation does not block installation:
+it stays running, without probing its authentication or requiring its token.
+The installer prints its executable path and manual switching instructions.
+Until switched, server/auto commands and MCP clients may keep using that daemon
+while direct commands use the newly installed binary. Remote servers are not
+controlled by the installer. A protected daemon owned by this installation needs
+its existing token before it can be restarted.
 Recovery records whether authentication is required, without storing token values.
 After an interruption, supply the original token environment or `--token-file`;
 missing credentials cannot restart a protected service anonymously. Saved token-file
@@ -168,10 +172,21 @@ restores the old directory and service; an interrupted transaction is recovered
 when the installer next runs. Stop direct CLI processes before updating on
 Windows: locked EXE/DLL files can prevent directory replacement. The installer
 reports the failure and preserves recovery state if it cannot restore immediately.
+Recovery that needs to restart an owned daemon still refuses to take over an
+external daemon that appeared after the interruption; stop that daemon explicitly
+before retrying. Uninstall leaves external daemons running.
 
 Existing supported integration launchers can be migrated to the stable absolute
 entry using `zg --install --upgrade-installed --launcher <ABSOLUTE_EXECUTABLE>`.
 The existing configuration backup and comment-preservation behavior is retained.
+With an external daemon, the installer only previews this migration (`--dry-run`):
+configuration files and backups remain unchanged. Pause clients, apply the printed
+migration command, explicitly stop the old daemon with its original credentials,
+and start the new launcher with the same home, listen address, toolset and
+authentication settings before reconnecting. HTTP integrations retain their URLs.
+With an owned daemon or no daemon, supported configurations migrate automatically;
+the latter does not start a daemon. Existing arguments and environment settings are
+preserved. Custom wrappers or unsupported configurations require manual edits.
 Migration failures are reported without discarding a successfully installed
 runtime. CI, root/elevated installs and the explicit skip flag do not migrate
 personal integrations. Reconnect existing MCP/stdio clients after an upgrade.

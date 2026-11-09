@@ -115,10 +115,29 @@ impl Fixture {
 
     fn command(&self, executable: &Path) -> Command {
         let mut command = Command::new(executable);
+        for name in [
+            "CODEX_HOME",
+            "GROK_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "QWEN_HOME",
+            "QODER_CONFIG_DIR",
+            "QODER_IDE_MCP_PATH",
+            "COPILOT_HOME",
+            "CURSOR_CONFIG_DIR",
+            "OPENCODE_CONFIG",
+            "PI_CODING_AGENT_DIR",
+            "VSCODE_PORTABLE",
+            "ZVEC_GREP_INSTALL_SKIP_SERVER",
+        ] {
+            command.env_remove(name);
+        }
         command
             .env("ZVEC_GREP_HOME", &self.home)
             .env("HOME", self.root.path())
             .env("USERPROFILE", self.root.path())
+            .env("XDG_CONFIG_HOME", self.root.path().join(".config"))
+            .env("APPDATA", self.root.path().join("AppData/Roaming"))
+            .env("VSCODE_USER_DIR", self.root.path().join("vscode/User"))
             .env_remove("ZVEC_GREP_SERVER_TOKEN")
             .env_remove("ZVEC_GREP_SERVER_TOKEN_FILE");
         if let Some(token) = &self.token {
@@ -128,6 +147,12 @@ impl Fixture {
     }
 
     fn install_command(&self) -> Command {
+        let mut command = self.install_with_agents_command();
+        command.arg("--skip-agent-upgrade");
+        command
+    }
+
+    fn install_with_agents_command(&self) -> Command {
         let mut command = self.command(&executable_path(&self.bundle));
         command
             .args(["--standalone", "--install-dir"])
@@ -135,12 +160,7 @@ impl Fixture {
         #[cfg(unix)]
         command.arg("--launcher").arg(self.launcher());
         command
-            .args([
-                "--accelerator",
-                "cpu",
-                "--no-modify-path",
-                "--skip-agent-upgrade",
-            ])
+            .args(["--accelerator", "cpu", "--no-modify-path"])
             .arg("--home")
             .arg(&self.home);
         command
@@ -177,17 +197,103 @@ impl Fixture {
             .expect("instance token")
             .to_owned()
     }
+
+    fn agent_config(&self) -> PathBuf {
+        self.root.path().join(".cursor/mcp.json")
+    }
+
+    fn write_agent_config(&self) -> Value {
+        let config = json!({"mcpServers": {
+            "zvec_grep": {
+                "command": "node", "args": [self.root.path().join("node_modules/@zvec/zvec-grep/dist/cli/index.js"), "server", "--stdio"],
+                "env": {"ZVEC_GREP_HOME": self.home, "CUSTOM": "preserved"}, "timeout": 913
+            },
+            "native": {"command": executable_path(&self.root.path().join("old install")), "args": ["--server", "--stdio", "--home", self.home]},
+            "http": {"url": "http://127.0.0.1:9123/mcp", "headers": {"Authorization": "Bearer keep"}},
+            "unrelated": {"command": "other", "args": []}
+        }});
+        fs::create_dir_all(self.agent_config().parent().expect("config directory"))
+            .expect("config directory");
+        fs::write(
+            self.agent_config(),
+            serde_json::to_vec_pretty(&config).expect("JSON"),
+        )
+        .expect("agent config");
+        config
+    }
+
+    fn agent_backups(&self) -> Vec<PathBuf> {
+        fs::read_dir(self.agent_config().parent().expect("config directory"))
+            .expect("config directory")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| path.to_string_lossy().contains(".zg-upgrade-"))
+            .collect()
+    }
+
+    fn assert_agent_migrated(&self, mut original: Value) {
+        let launcher = if cfg!(windows) {
+            self.launcher().canonicalize().expect("absolute executable")
+        } else {
+            self.launcher()
+        };
+        original["mcpServers"]["zvec_grep"]["command"] = json!(launcher);
+        original["mcpServers"]["native"]["command"] = json!(launcher);
+        original["mcpServers"]["zvec_grep"]["args"] = json!(["--server", "--stdio"]);
+        let updated: Value =
+            serde_json::from_slice(&fs::read(self.agent_config()).expect("config"))
+                .expect("updated JSON");
+        assert_eq!(updated, original);
+        assert_eq!(self.agent_backups().len(), 1);
+    }
+
+    fn assert_agent_unchanged(&self, original: &[u8]) {
+        assert_eq!(fs::read(self.agent_config()).expect("config"), original);
+        assert!(self.agent_backups().is_empty());
+    }
+
+    fn assert_external_preview(&self, output: Output, executable: &Path) {
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        success(output);
+        for message in [
+            "External daemon left running",
+            "preview-only",
+            "Would upgrade: 2",
+            "Manual daemon switch required",
+        ] {
+            assert!(stdout.contains(message), "{stdout}");
+        }
+        let stop = stdout
+            .lines()
+            .find(|line| line.contains("3. Stop the external daemon"))
+            .expect("manual stop command");
+        assert!(
+            stop.contains(self.launcher().to_string_lossy().as_ref()),
+            "{stop}"
+        );
+        assert!(
+            stdout.contains(
+                executable
+                    .canonicalize()
+                    .expect("executable")
+                    .to_string_lossy()
+                    .as_ref()
+            ),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(self.home.to_string_lossy().as_ref()),
+            "{stdout}"
+        );
+    }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        if self.installed().exists() {
-            let _ = self
-                .command(&self.installed())
-                .args(["--server", "off", "--home"])
-                .arg(&self.home)
-                .output();
-        }
+        let _ = self
+            .command(Path::new(env!("CARGO_BIN_EXE_zg")))
+            .args(["--server", "off", "--home"])
+            .arg(&self.home)
+            .output();
     }
 }
 
@@ -256,8 +362,15 @@ fn standalone_upgrade_restarts_owned_daemon_preserves_data_and_recovers_interrup
             .expect("start"),
     );
     let first_instance = fixture.instance_token();
+    let original_config = fixture.write_agent_config();
     fixture.write_manifest("second");
-    success(fixture.install());
+    success(
+        fixture
+            .install_with_agents_command()
+            .output()
+            .expect("upgrade with agents"),
+    );
+    fixture.assert_agent_migrated(original_config);
     // Windows may reuse a PID immediately; the instance token identifies each daemon lifetime.
     assert_ne!(fixture.instance_token(), first_instance);
     assert_eq!(
@@ -460,8 +573,11 @@ fn standalone_uninstall_preserves_a_replaced_command_entry() {
 }
 
 #[test]
-fn standalone_refuses_a_daemon_owned_by_another_installation() {
-    let fixture = Fixture::new();
+fn external_daemon_allows_install_and_recovery_but_only_previews_agent_migration() {
+    let mut fixture = Fixture::new();
+    fixture.token = Some("external-daemon-regression-token-at-least-32-characters".to_owned());
+    let original_config = fixture.write_agent_config();
+    let original_bytes = fs::read(fixture.agent_config()).expect("original config");
     let socket = TcpListener::bind("127.0.0.1:0").expect("port");
     let address = socket.local_addr().expect("address").to_string();
     drop(socket);
@@ -474,19 +590,151 @@ fn standalone_refuses_a_daemon_owned_by_another_installation() {
             .output()
             .expect("start external installation"),
     );
-    let pid = fixture.pid();
-    let output = fixture.install();
-    let same_pid = fixture.pid();
+    let instance = fixture.instance_token();
+    let install_without_credentials = || {
+        fixture
+            .install_with_agents_command()
+            .env_remove("ZVEC_GREP_SERVER_TOKEN")
+            .output()
+            .expect("install alongside external daemon")
+    };
+    fixture.assert_external_preview(install_without_credentials(), executable);
+    assert!(fixture.installed().exists());
+    assert_eq!(fixture.instance_token(), instance);
+    fixture.assert_agent_unchanged(&original_bytes);
+
+    // Recovery without an owned service must also leave the external daemon untouched.
+    fs::rename(
+        fixture.install.join("current"),
+        fixture.install.join("previous"),
+    )
+    .expect("interrupted move");
+    fs::write(
+        fixture.install.join("pending.json"),
+        serde_json::to_vec(&json!({
+            "hadPrevious": true, "home": fixture.home, "restart": null
+        }))
+        .expect("journal"),
+    )
+    .expect("write journal");
+    fixture.write_manifest("second");
+    success(install_without_credentials());
+    assert!(!fixture.install.join("pending.json").exists());
+    assert_eq!(fixture.instance_token(), instance);
+    fixture.assert_agent_unchanged(&original_bytes);
+    assert_eq!(
+        fs::read_to_string(fixture.install.join("current/marker")).expect("current"),
+        "second"
+    );
+
     success(
         fixture
-            .command(executable)
+            .command(&executable_path(&fixture.bundle))
+            .args(["--standalone", "--remove", "--install-dir"])
+            .arg(&fixture.install)
+            .env_remove("ZVEC_GREP_SERVER_TOKEN")
+            .output()
+            .expect("uninstall alongside external daemon"),
+    );
+    assert!(!fixture.installed().exists());
+    assert_eq!(fixture.instance_token(), instance);
+    fixture.assert_agent_unchanged(&original_bytes);
+    success(install_without_credentials());
+    success(
+        fixture
+            .command(&fixture.launcher())
             .args(["--server", "off", "--home"])
             .arg(&fixture.home)
             .output()
             .expect("stop external installation"),
     );
+    success(install_without_credentials());
+    fixture.assert_agent_migrated(original_config);
+    assert!(std::net::TcpStream::connect(address).is_err());
+}
+
+#[test]
+fn recovery_cannot_replace_an_external_daemon_when_owned_restart_is_pending() {
+    let fixture = Fixture::new();
+    success(fixture.install());
+    fs::rename(
+        fixture.install.join("current"),
+        fixture.install.join("previous"),
+    )
+    .expect("interrupted move");
+    let socket = TcpListener::bind("127.0.0.1:0").expect("port");
+    let address = socket.local_addr().expect("address").to_string();
+    drop(socket);
+    fs::write(fixture.install.join("pending.json"), serde_json::to_vec(&json!({
+        "hadPrevious": true, "home": fixture.home,
+        "restart": { "home": fixture.home, "listen": address, "toolset": "agent", "tokenFile": null, "authenticationRequired": false }
+    })).expect("journal")).expect("write journal");
+    success(
+        fixture
+            .command(Path::new(env!("CARGO_BIN_EXE_zg")))
+            .args(["--server", "on", "--listen", &address, "--home"])
+            .arg(&fixture.home)
+            .output()
+            .expect("start external daemon"),
+    );
+    let instance = fixture.instance_token();
+    let output = fixture.install();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("another executable"));
-    assert_eq!(pid, same_pid);
-    assert!(!fixture.installed().exists());
+    assert_eq!(fixture.instance_token(), instance);
+    assert!(fixture.install.join("pending.json").exists());
+    assert!(fixture.install.join("previous").exists());
+    assert!(!fixture.install.join("current").exists());
+}
+
+#[test]
+fn daemon_running_from_previous_bundle_prevents_deleting_its_executable() {
+    let fixture = Fixture::new();
+    success(fixture.install());
+    fs::rename(
+        fixture.install.join("current"),
+        fixture.install.join("previous"),
+    )
+    .expect("move previous bundle");
+    let socket = TcpListener::bind("127.0.0.1:0").expect("port");
+    let address = socket.local_addr().expect("address").to_string();
+    drop(socket);
+    let executable = executable_path(&fixture.install.join("previous"));
+    success(
+        fixture
+            .command(&executable)
+            .args(["--server", "on", "--listen", &address, "--home"])
+            .arg(&fixture.home)
+            .output()
+            .expect("start misplaced daemon"),
+    );
+    let instance = fixture.instance_token();
+    let output = fixture.install();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("another executable"));
+    assert_eq!(fixture.instance_token(), instance);
+    assert!(executable.exists());
+    assert!(!fixture.install.join("pending.json").exists());
+    assert!(!fixture.install.join("next").exists());
+}
+
+#[test]
+fn agent_migration_failure_does_not_roll_back_a_successful_installation() {
+    let fixture = Fixture::new();
+    fixture.write_agent_config();
+    fs::write(fixture.agent_config(), "{ invalid json").expect("broken config");
+    let output = fixture
+        .install_with_agents_command()
+        .output()
+        .expect("install");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    success(output);
+    assert!(stderr.contains("migration needs attention"), "{stderr}");
+    assert!(fixture.installed().exists());
+    assert!(!fixture.install.join("pending.json").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.agent_config()).expect("config"),
+        "{ invalid json"
+    );
+    assert!(fixture.agent_backups().is_empty());
 }

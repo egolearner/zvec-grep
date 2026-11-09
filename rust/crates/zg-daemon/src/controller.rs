@@ -127,10 +127,12 @@ pub struct InstallationDaemon {
     token_file: Option<PathBuf>,
     config: Option<ServerConfig>,
     authentication_required: bool,
+    external_executable: Option<PathBuf>,
 }
 
 impl InstallationDaemon {
-    /// Claims a local home and verifies that any running daemon belongs to this installation.
+    /// Claims a local home and distinguishes owned daemons from external installations.
+    /// External daemons are observed without probing their credentials or stopping them.
     ///
     /// # Errors
     /// Returns ownership, locking, instance-record or configuration errors.
@@ -149,9 +151,14 @@ impl InstallationDaemon {
             token_file: token_file.map(std::path::absolute).transpose()?,
             config: None,
             authentication_required: false,
+            external_executable: None,
         };
         if let Some(record) = read_running_instance(home).await? {
-            guard.verify_executable(&record)?;
+            let executable = Self::process_executable(&record)?;
+            if !guard.owns_executable(&executable) {
+                guard.external_executable = Some(executable);
+                return Ok(guard);
+            }
             let mut config =
                 ServerConfig::new(record_address(&record, home).await?, home.to_owned());
             // GET cannot shut down the service, but still crosses its authentication middleware.
@@ -200,31 +207,61 @@ impl InstallationDaemon {
         self.authentication_required
     }
 
-    fn verify_executable(&self, record: &DaemonInstanceRecord) -> Result<(), DaemonError> {
+    #[must_use]
+    pub fn external_executable(&self) -> Option<&Path> {
+        self.external_executable.as_deref()
+    }
+
+    /// Rejects a restart or recovery that would take over an external daemon.
+    ///
+    /// # Errors
+    /// Returns an installation conflict when the active daemon belongs elsewhere.
+    pub fn require_owned(&self) -> Result<(), DaemonError> {
+        if let Some(executable) = &self.external_executable {
+            return Err(DaemonError::InstallationConflict {
+                executable: executable.display().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn process_executable(record: &DaemonInstanceRecord) -> Result<PathBuf, DaemonError> {
         let actual =
             with_process(record.pid, |process| process.exe().map(Path::to_owned)).flatten();
-        let matches = actual
+        actual
             .as_ref()
             .and_then(|path| path.canonicalize().ok())
-            .is_some_and(|actual| {
-                self.executables
-                    .iter()
-                    .any(|expected| expected.canonicalize().ok().as_ref() == Some(&actual))
-            });
-        if !matches {
-            return Err(DaemonError::InstallationConflict {
+            .ok_or_else(|| DaemonError::InstallationConflict {
                 executable: actual
                     .map_or_else(|| "unknown".to_owned(), |path| path.display().to_string()),
+            })
+    }
+
+    fn owns_executable(&self, actual: &Path) -> bool {
+        self.executables
+            .iter()
+            .any(|expected| expected.canonicalize().ok().as_deref() == Some(actual))
+    }
+
+    fn verify_executable(&self, record: &DaemonInstanceRecord) -> Result<(), DaemonError> {
+        let actual = Self::process_executable(record)?;
+        if !self.owns_executable(&actual) {
+            return Err(DaemonError::InstallationConflict {
+                executable: actual.display().to_string(),
             });
         }
         Ok(())
     }
 
     /// Stops only this installation's verified process, without signal escalation.
+    /// External daemons are left running.
     ///
     /// # Errors
     /// Returns identity, authentication, shutdown or timeout errors.
     pub async fn stop(&self) -> Result<(), DaemonError> {
+        if self.external_executable.is_some() {
+            return Ok(());
+        }
         if let Some(record) = read_running_instance(&self.home).await? {
             self.verify_executable(&record)?;
             let token = crate::resolve_token(self.token_file.as_deref())?;
@@ -250,6 +287,7 @@ impl InstallationDaemon {
         config: Option<&ServerConfig>,
     ) -> Result<(), DaemonError> {
         if let Some(config) = config {
+            self.require_owned()?;
             start_server_with_lock(executable, config).await?;
             let record = read_running_instance(&self.home)
                 .await?

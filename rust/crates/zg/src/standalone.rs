@@ -333,6 +333,9 @@ async fn rollback(
         .as_ref()
         .map(|restart| restart.config(token_file))
         .transpose()?;
+    if restart.is_some() {
+        daemon.require_owned()?;
+    }
     daemon.stop().await?;
     let current = root.join("current");
     let previous = root.join("previous");
@@ -495,6 +498,23 @@ fn installation_home(args: &StandaloneArgs, root: &Path, old: Option<&Receipt>) 
     Ok(home)
 }
 
+async fn installation_daemon(
+    root: &Path,
+    home: &Path,
+    token_file: Option<&Path>,
+) -> Result<InstallationDaemon> {
+    let daemon =
+        InstallationDaemon::acquire(home, &[binary(&root.join("current"))], token_file).await?;
+    if daemon
+        .external_executable()
+        .is_some_and(|executable| executable.starts_with(root))
+    {
+        // A misplaced process inside the managed tree cannot survive replacing that tree.
+        daemon.require_owned()?;
+    }
+    Ok(daemon)
+}
+
 pub async fn execute(args: &StandaloneArgs) -> Result<()> {
     let root = std::path::absolute(&args.install_dir)?;
     let _lock = installation_lock(&root)?;
@@ -544,10 +564,10 @@ pub async fn execute(args: &StandaloneArgs) -> Result<()> {
     }
     let receipt = prepare_candidate(args, &executable, &next, &home, launcher.as_ref()).await?;
     let _candidate_cleanup = CandidateCleanup(Some(&next));
+    let daemon = installation_daemon(&root, &home, token_file).await?;
     // The prior rollback copy is removed before the journal is created, so its
     // presence unambiguously means that the current transaction moved the old bundle.
     remove_directory(&previous)?;
-    let daemon = InstallationDaemon::acquire(&home, &[binary(&current)], token_file).await?;
     let pending = Pending {
         had_previous: old.is_some(),
         home,
@@ -588,47 +608,129 @@ pub async fn execute(args: &StandaloneArgs) -> Result<()> {
         return Err(error);
     }
     fs::remove_file(root.join("pending.json"))?;
+    let external_executable = daemon.external_executable().map(Path::to_owned);
     drop(daemon);
-    complete_installation(args, receipt.as_ref(), &current, &previous)
+    complete_installation(
+        args,
+        receipt.as_ref(),
+        &root,
+        external_executable.as_deref(),
+    )
+}
+
+fn shell_command(executable: &Path, arguments: &[&str]) -> String {
+    let executable = executable.to_string_lossy();
+    let words = std::iter::once(executable.as_ref())
+        .chain(arguments.iter().copied())
+        .map(|word| {
+            let escaped = if cfg!(windows) {
+                word.replace('\'', "''")
+            } else {
+                word.replace('\'', "'\\''")
+            };
+            format!("'{escaped}'")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{}{words}", if cfg!(windows) { "& " } else { "" })
+}
+
+fn migration_command(launcher: &Path, preview: bool) -> String {
+    let launcher_path = launcher.to_string_lossy();
+    let mut arguments = vec![
+        "--install",
+        "--upgrade-installed",
+        "--launcher",
+        &launcher_path,
+    ];
+    if preview {
+        arguments.push("--dry-run");
+    }
+    shell_command(launcher, &arguments)
+}
+
+fn print_manual_switch(args: &StandaloneArgs, receipt: &Receipt, launcher: &Path) {
+    let home = receipt.home.to_string_lossy();
+    let token_file = args.token_file.as_ref().map(|path| path.to_string_lossy());
+    let mut stop = vec!["--server", "off", "--home", home.as_ref()];
+    if let Some(token_file) = &token_file {
+        stop.extend(["--token-file", token_file.as_ref()]);
+    }
+    println!(
+        "Manual daemon switch required for home {}:",
+        receipt.home.display()
+    );
+    println!("  1. Pause existing MCP clients so their old launchers cannot restart the daemon.");
+    println!(
+        "  2. Apply the agent configuration migration: {}",
+        migration_command(launcher, false)
+    );
+    println!(
+        "  3. Stop the external daemon: {}",
+        shell_command(launcher, &stop)
+    );
+    println!(
+        "  4. Start the new daemon with {}, adding its previous --listen, --mcp-toolset and authentication settings, then reconnect clients.",
+        shell_command(launcher, &["--server", "on", "--home", home.as_ref()])
+    );
+    println!("Use the original token environment or --token-file for authenticated daemons.");
 }
 
 fn complete_installation(
     args: &StandaloneArgs,
     receipt: Option<&Receipt>,
-    current: &Path,
-    previous: &Path,
+    root: &Path,
+    external: Option<&Path>,
 ) -> Result<()> {
+    let current = root.join("current");
+    if let Some(external) = external {
+        println!("External daemon left running: {}", external.display());
+        println!(
+            "Server/auto commands and MCP clients may still use that daemon; installing this binary does not switch it."
+        );
+    }
     if let Some(receipt) = receipt {
         println!(
             "Installed zvec-grep {} ({}, {}) at {}",
             receipt.version,
             receipt.target,
             receipt.accelerator_actual,
-            binary(current).display()
+            binary(&current).display()
         );
         if receipt.accelerator_actual == "cuda" {
             println!(
                 "CUDA plugins installed. Compatible NVIDIA drivers and CUDA/cuBLAS/cuDNN host libraries are still required."
             );
         }
+        let launcher = receipt.launcher.clone().unwrap_or_else(|| binary(&current));
         if !args.skip_agent_upgrade {
-            let launcher = receipt.launcher.clone().unwrap_or_else(|| binary(current));
-            let status = Command::new(&launcher)
+            let mut command = Command::new(&launcher);
+            command
                 .args(["--install", "--upgrade-installed", "--launcher"])
                 .arg(&launcher)
-                .stdin(Stdio::null())
-                .status();
+                .stdin(Stdio::null());
+            if external.is_some() {
+                println!(
+                    "Agent configuration migration is preview-only while an external daemon is running."
+                );
+                command.arg("--dry-run");
+            }
+            let status = command.status();
             if !status.is_ok_and(|status| status.success()) {
                 eprintln!(
-                    "Existing integration migration needs attention; rerun zg --install --upgrade-installed --launcher with the installed absolute executable path."
+                    "Existing integration migration needs attention; retry: {}",
+                    migration_command(&launcher, external.is_some())
                 );
             }
         }
-        println!(
-            "Reconnect existing MCP clients to use the new version. Re-run the installer to upgrade or select an older version."
-        );
+        if external.is_some() {
+            print_manual_switch(args, receipt, &launcher);
+        } else {
+            println!("Reconnect existing MCP clients to use the new version.");
+        }
+        println!("Re-run the installer to upgrade or select an older version.");
     } else {
-        remove_directory(previous)?;
+        remove_directory(&root.join("previous"))?;
         println!("Removed standalone binaries. Configuration, models and indexes were preserved.");
     }
     Ok(())
