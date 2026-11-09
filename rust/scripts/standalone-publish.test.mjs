@@ -37,6 +37,7 @@ test("publication waits for a complete server-verified draft before promoting La
   const gh = (args) => {
     calls.push(args);
     if (args[0] === "api") {
+      if (args[1].endsWith("/latest")) throw new Error("HTTP 404: Not Found");
       if (!created) throw new Error("HTTP 404: Not Found");
       return JSON.stringify({ draft: true, assets: data.assets });
     }
@@ -44,8 +45,33 @@ test("publication waits for a complete server-verified draft before promoting La
     return "";
   };
   await publishStandaloneRelease({ ...data, gh });
-  assert.deepEqual(calls.map((args) => args[0] === "api" ? "verify" : args[1]), ["verify", "create", "upload", "verify", "edit"]);
-  assert.ok(calls.at(-1).includes("--latest"));
+  assert.deepEqual(calls.map((args) => args[0] === "api" ? "verify" : args[1]), ["verify", "create", "upload", "verify", "verify", "edit"]);
+  assert.ok(calls.at(-1).includes("--latest=true"));
+});
+
+test("retrying an older draft never demotes Latest and comparison errors fail closed", async (t) => {
+  const data = await fixture(t);
+  for (const [tag, expected] of [["rust-v1.2.4", false], ["v1.2.2", true], ["rust-v1.2.3", false], ["rust-v1.10.0", false]]) {
+    const calls = [];
+    await publishStandaloneRelease({ ...data, gh: (args) => {
+      calls.push(args);
+      if (args[0] === "api") return JSON.stringify(args[1].endsWith("/latest") ? { tag_name: tag } : { draft: true, assets: data.assets });
+      return "";
+    } });
+    assert.ok(calls.at(-1).includes(`--latest=${expected}`), tag);
+  }
+  for (const error of [new Error("HTTP 403: denied"), undefined]) {
+    const calls = [];
+    await assert.rejects(publishStandaloneRelease({ ...data, gh: (args) => {
+      calls.push(args);
+      if (args[0] === "api" && args[1].endsWith("/latest")) {
+        if (error) throw error;
+        return JSON.stringify({ tag_name: "unknown" });
+      }
+      return JSON.stringify({ draft: true, assets: data.assets });
+    } }));
+    assert.equal(calls.some((args) => args[1] === "edit"), false);
+  }
 });
 
 test("incomplete uploads and unavailable API cannot publish or create an unverified release", async (t) => {

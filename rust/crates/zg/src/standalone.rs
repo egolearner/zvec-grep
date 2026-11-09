@@ -8,6 +8,7 @@ use std::{
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,8 @@ struct Receipt {
     home: PathBuf,
     modify_path: bool,
     #[serde(default)]
+    path_managed: bool,
+    #[serde(default)]
     launcher: Option<PathBuf>,
 }
 
@@ -61,26 +64,37 @@ struct Restart {
     listen: String,
     toolset: String,
     token_file: Option<PathBuf>,
+    #[serde(default)]
+    authentication_required: Option<bool>,
 }
 
 impl Restart {
-    fn from_config(config: &ServerConfig) -> Self {
+    fn from_config(config: &ServerConfig, authentication_required: bool) -> Self {
         Self {
             home: config.home.clone(),
             listen: config.listen.to_string(),
             toolset: config.mcp_toolset.unwrap_or_default().to_string(),
             token_file: config.token_file.clone(),
+            authentication_required: Some(authentication_required),
         }
     }
 
-    fn config(&self) -> Result<ServerConfig> {
+    fn config(&self, token_file: Option<&Path>) -> Result<ServerConfig> {
         let mut config = ServerConfig::new(self.listen.parse()?, self.home.clone());
         config.mcp_toolset = Some(match self.toolset.as_str() {
             "agent" => zg_daemon::McpToolset::Agent,
             "full" => zg_daemon::McpToolset::Full,
             _ => return Err(io::Error::other("invalid saved daemon toolset").into()),
         });
-        config.token_file.clone_from(&self.token_file);
+        config.token_file = token_file
+            .map(Path::to_owned)
+            .or_else(|| self.token_file.clone());
+        // Legacy journals do not establish that anonymous restart was safe.
+        if self.authentication_required.unwrap_or(true)
+            && zg_daemon::resolve_token(config.token_file.as_deref())?.is_none()
+        {
+            return Err(io::Error::other("recovery requires the daemon authentication token; supply --token-file or the original token environment").into());
+        }
         Ok(config)
     }
 }
@@ -276,11 +290,26 @@ fn installation_lock(root: &Path) -> Result<File> {
     Ok(lock)
 }
 
-fn check_binary(path: &Path, version: &str) -> Result<()> {
-    let output = Command::new(path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()?;
+async fn check_binary(path: &Path, version: &str) -> Result<()> {
+    check_binary_with_timeout(path, version, Duration::from_secs(10)).await
+}
+
+async fn check_binary_with_timeout(path: &Path, version: &str, timeout: Duration) -> Result<()> {
+    let output = tokio::time::timeout(
+        timeout,
+        tokio::process::Command::new(path)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        io::Error::other(format!(
+            "executable version check timed out: {}",
+            path.display()
+        ))
+    })??;
     if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim() != version {
         return Err(io::Error::other(format!(
             "installed executable failed its version check: {} ({}); {}",
@@ -293,7 +322,17 @@ fn check_binary(path: &Path, version: &str) -> Result<()> {
     Ok(())
 }
 
-async fn rollback(root: &Path, pending: &Pending, daemon: &InstallationDaemon) -> Result<()> {
+async fn rollback(
+    root: &Path,
+    pending: &Pending,
+    daemon: &InstallationDaemon,
+    token_file: Option<&Path>,
+) -> Result<()> {
+    let restart = pending
+        .restart
+        .as_ref()
+        .map(|restart| restart.config(token_file))
+        .transpose()?;
     daemon.stop().await?;
     let current = root.join("current");
     let previous = root.join("previous");
@@ -306,15 +345,14 @@ async fn rollback(root: &Path, pending: &Pending, daemon: &InstallationDaemon) -
     if let Some(launcher) = &pending.launcher {
         launcher.restore()?;
     }
-    let restart = pending.restart.as_ref().map(Restart::config).transpose()?;
     daemon.restart(&binary(&current), restart.as_ref()).await?;
     fs::remove_file(root.join("pending.json"))?;
     Ok(())
 }
 
-async fn recover(root: &Path, token_file: Option<&Path>) -> Result<()> {
+async fn recover(root: &Path, token_file: Option<&Path>) -> Result<Option<PathBuf>> {
     if !root.join("pending.json").exists() {
-        return Ok(());
+        return Ok(None);
     }
     let pending: Pending = read_json(&root.join("pending.json"))?;
     let token_file = token_file.or_else(|| {
@@ -323,6 +361,9 @@ async fn recover(root: &Path, token_file: Option<&Path>) -> Result<()> {
             .as_ref()
             .and_then(|restart| restart.token_file.as_deref())
     });
+    if let Some(restart) = &pending.restart {
+        restart.config(token_file)?;
+    }
     let daemon = InstallationDaemon::acquire(
         &pending.home,
         &[
@@ -332,12 +373,29 @@ async fn recover(root: &Path, token_file: Option<&Path>) -> Result<()> {
         token_file,
     )
     .await?;
-    rollback(root, &pending, &daemon).await?;
+    rollback(root, &pending, &daemon, token_file).await?;
     eprintln!("Recovered the previous installation after an interrupted update.");
-    Ok(())
+    Ok(token_file.map(Path::to_owned))
 }
 
-fn prepare_candidate(
+fn release_source(repository: &str) -> Result<String> {
+    let parts: Vec<_> = repository.split('/').collect();
+    if parts.len() != 2
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || *part == "."
+                || *part == ".."
+                || !part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        })
+    {
+        return Err(io::Error::other("repository must be a GitHub owner/name").into());
+    }
+    Ok(format!("https://github.com/{repository}/releases"))
+}
+
+async fn prepare_candidate(
     args: &StandaloneArgs,
     executable: &Path,
     next: &Path,
@@ -358,30 +416,47 @@ fn prepare_candidate(
     {
         return Err(io::Error::other("requested accelerator does not match the bundle").into());
     }
+    let mut candidate = CandidateCleanup(Some(next));
     copy_bundle(source_root, next, &manifest)?;
     verify_bundle(next)?;
     let receipt = Receipt {
         schema_version: 1,
-        source: "https://github.com/zvec-ai/zvec-grep/releases".to_owned(),
+        source: release_source(&args.repository)?,
         version: manifest.version,
         target: manifest.target,
         accelerator_requested: args.accelerator.clone(),
         accelerator_actual: manifest.accelerator,
         home: home.to_owned(),
         modify_path: !args.no_modify_path,
+        path_managed: args.path_managed,
         launcher: launcher.map(|launcher| launcher.path.clone()),
     };
     write_json(&next.join(RECEIPT), &receipt)?;
     fs::write(
         next.join("install-state.tsv"),
         format!(
-            "accelerator\t{}\nmodify_path\t{}\n",
+            "accelerator\t{}\nmodify_path\t{}\npath_managed\t{}\nrepository\t{}\n",
             receipt.accelerator_requested,
-            u8::from(receipt.modify_path)
+            u8::from(receipt.modify_path),
+            u8::from(receipt.path_managed),
+            args.repository
         ),
     )?;
-    check_binary(&binary(next), &receipt.version)?;
+    check_binary(&binary(next), &receipt.version).await?;
+    candidate.0 = None;
     Ok(Some(receipt))
+}
+
+struct CandidateCleanup<'a>(Option<&'a Path>);
+
+impl Drop for CandidateCleanup<'_> {
+    fn drop(&mut self) {
+        if let Some(path) = self.0
+            && let Err(error) = remove_directory(path)
+        {
+            eprintln!("Failed to clean candidate {}: {error}", path.display());
+        }
+    }
 }
 
 fn check_data_layout(root: &Path, home: &Path) -> Result<()> {
@@ -424,7 +499,11 @@ pub async fn execute(args: &StandaloneArgs) -> Result<()> {
     let root = std::path::absolute(&args.install_dir)?;
     let _lock = installation_lock(&root)?;
     let root = root.canonicalize()?;
-    recover(&root, args.token_file.as_deref()).await?;
+    let recovered_token_file = recover(&root, args.token_file.as_deref()).await?;
+    let token_file = args
+        .token_file
+        .as_deref()
+        .or(recovered_token_file.as_deref());
     let current = root.join("current");
     let previous = root.join("previous");
     let next = root.join("next");
@@ -463,16 +542,18 @@ pub async fn execute(args: &StandaloneArgs) -> Result<()> {
         )
         .into());
     }
-    let receipt = prepare_candidate(args, &executable, &next, &home, launcher.as_ref())?;
+    let receipt = prepare_candidate(args, &executable, &next, &home, launcher.as_ref()).await?;
+    let _candidate_cleanup = CandidateCleanup(Some(&next));
     // The prior rollback copy is removed before the journal is created, so its
     // presence unambiguously means that the current transaction moved the old bundle.
     remove_directory(&previous)?;
-    let daemon =
-        InstallationDaemon::acquire(&home, &[binary(&current)], args.token_file.as_deref()).await?;
+    let daemon = InstallationDaemon::acquire(&home, &[binary(&current)], token_file).await?;
     let pending = Pending {
         had_previous: old.is_some(),
         home,
-        restart: daemon.config().map(Restart::from_config),
+        restart: daemon
+            .config()
+            .map(|config| Restart::from_config(config, daemon.authentication_required())),
         launcher,
     };
     let journal = root.join(".pending-new.json");
@@ -488,10 +569,10 @@ pub async fn execute(args: &StandaloneArgs) -> Result<()> {
         }
         if let Some(receipt) = &receipt {
             fs::rename(&next, &current)?;
-            check_binary(&binary(&current), &receipt.version)?;
+            check_binary(&binary(&current), &receipt.version).await?;
             if let Some(launcher) = &pending.launcher {
                 launcher.install()?;
-                check_binary(&launcher.path, &receipt.version)?;
+                check_binary(&launcher.path, &receipt.version).await?;
             }
             daemon.restart(&binary(&current), daemon.config()).await?;
         } else if let Some(launcher) = &pending.launcher {
@@ -501,7 +582,7 @@ pub async fn execute(args: &StandaloneArgs) -> Result<()> {
     }
     .await;
     if let Err(error) = result {
-        if let Err(recovery) = rollback(&root, &pending, &daemon).await {
+        if let Err(recovery) = rollback(&root, &pending, &daemon, token_file).await {
             return Err(io::Error::other(format!("installation failed: {error}; recovery failed: {recovery}; rerun the installer to recover")).into());
         }
         return Err(error);
@@ -556,6 +637,87 @@ fn complete_installation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn version_probe_has_a_hard_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("temp");
+        let executable = temp.path().join("slow");
+        fs::write(&executable, "#!/bin/sh\nexec sleep 30\n").expect("probe");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).expect("permissions");
+        let error = check_binary_with_timeout(&executable, "1", Duration::from_millis(100))
+            .await
+            .expect_err("deadline");
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn failed_candidate_preparation_removes_partial_files() {
+        let temp = tempfile::tempdir().expect("temp");
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join("bin")).expect("bin");
+        let executable = binary(&source);
+        fs::write(&executable, "fixture").expect("binary");
+        fs::write(source.join(RECEIPT), "{}").expect("conflicting receipt");
+        let digest = |bytes: &[u8]| {
+            let mut digest = String::new();
+            for byte in Sha256::digest(bytes) {
+                write!(digest, "{byte:02x}").expect("digest");
+            }
+            digest
+        };
+        let name = if cfg!(windows) {
+            "bin/zg.exe"
+        } else {
+            "bin/zg"
+        };
+        fs::write(source.join(MANIFEST), serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1, "version": env!("CARGO_PKG_VERSION"), "target": target(), "accelerator": "cpu",
+            "files": { (name): { "bytes": 7, "sha256": digest(b"fixture") }, (RECEIPT): { "bytes": 2, "sha256": digest(b"{}") } }
+        })).expect("manifest")).expect("manifest");
+        let root = temp.path().join("program");
+        fs::create_dir(&root).expect("root");
+        let next = root.join("next");
+        let args = StandaloneArgs {
+            install_dir: root,
+            launcher: None,
+            accelerator: "cpu".into(),
+            home: None,
+            token_file: None,
+            skip_agent_upgrade: true,
+            no_modify_path: true,
+            path_managed: false,
+            repository: "zvec-ai/zvec-grep".into(),
+            remove: false,
+        };
+        let error = prepare_candidate(&args, &executable, &next, temp.path(), None)
+            .await
+            .err()
+            .expect("receipt collision");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().expect("I/O error").kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert!(!next.exists());
+    }
+
+    #[test]
+    fn repository_overrides_remain_github_only() {
+        assert_eq!(
+            release_source("egolearner/zvec-grep").expect("fork"),
+            "https://github.com/egolearner/zvec-grep/releases"
+        );
+        for repository in [
+            "https://example.com/repo",
+            "owner/repo/extra",
+            "../repo",
+            "owner/repo?x",
+            "owner/repo\n",
+        ] {
+            assert!(release_source(repository).is_err());
+        }
+    }
 
     #[test]
     fn only_the_managed_bin_subtree_may_share_the_data_home() {

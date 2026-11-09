@@ -9,7 +9,7 @@ inputs:
     default: rust/dist/npm/release/tarballs
   standalone_directory:
     description: Optional workspace-relative standalone archives and installer metadata from this run.
-    default: ''
+    default: ""
 runs:
   using: composite
   steps:

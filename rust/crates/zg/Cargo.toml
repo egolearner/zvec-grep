@@ -19,7 +19,7 @@ serde_json.workspace = true
 serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true
 clap.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "process"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zg-cli = { path = "../zg-cli" }

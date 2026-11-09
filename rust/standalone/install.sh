@@ -4,6 +4,17 @@ set -eu
 set -f
 
 fail() { printf 'zvec-grep: %s\n' "$*" >&2; exit 1; }
+check_version() {
+    "$1" --version > "$staging/version" 2> "$staging/version-error" &
+    version_pid=$!
+    (sleep 10; kill -KILL "$version_pid" 2>/dev/null || :) >/dev/null 2>&1 &
+    version_watchdog=$!
+    version_status=0
+    wait "$version_pid" || version_status=$?
+    kill "$version_watchdog" 2>/dev/null || :
+    wait "$version_watchdog" 2>/dev/null || :
+    [ "$version_status" = 0 ] && [ "$(cat "$staging/version")" = "$2" ]
+}
 usage() {
     cat <<'EOF'
 Usage: install.sh [--version VERSION] [--accelerator auto|cpu|cuda]
@@ -17,7 +28,7 @@ EOF
 
 install_dir=${ZG_INSTALL_DIR:-"$HOME/.zvec-grep/bin"}
 version=
-base_url=https://github.com/zvec-ai/zvec-grep/releases
+repository=${ZG_INSTALL_REPOSITORY:-}
 accelerator=${ZG_INSTALL_ACCELERATOR:-}
 skip_agents=${ZG_INSTALL_SKIP_AGENT_UPGRADE:-0}
 remove=0
@@ -48,6 +59,10 @@ state="$install_dir/current/install-state.tsv"
 if [ -f "$install_dir/pending.json" ] && [ -f "$install_dir/previous/install-state.tsv" ]; then state="$install_dir/previous/install-state.tsv"; fi
 read_state() { if [ -f "$state" ]; then awk -F '\t' -v key="$1" '$1 == key {print $2; exit}' "$state"; fi; }
 [ -n "$accelerator" ] || accelerator=$(read_state accelerator)
+[ -n "$repository" ] || repository=$(read_state repository)
+repository=${repository:-zvec-ai/zvec-grep}
+printf '%s\n' "$repository" | LC_ALL=C grep -Eq '^[A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_-][A-Za-z0-9_.-]*$' || fail "repository must be a GitHub owner/name"
+base_url="https://github.com/$repository/releases"
 # The test server implements GitHub's release URL layout; it is never a persisted source.
 if [ -n "${ZG_INSTALL_TEST_RELEASE_URL:-}" ]; then
     printf '%s\n' "$ZG_INSTALL_TEST_RELEASE_URL" | LC_ALL=C grep -Eq '^http://127\.0\.0\.1:[0-9]+$' || fail "invalid test release server"
@@ -102,7 +117,7 @@ has_nvidia() {
     command -v nvidia-smi >/dev/null 2>&1 || return 1
     nvidia-smi --query-gpu=name,driver_version --format=csv,noheader >"$staging/nvidia" 2>/dev/null &
     probe_pid=$!
-    (sleep 5; kill "$probe_pid" 2>/dev/null || :) &
+    (sleep 5; kill -KILL "$probe_pid" 2>/dev/null || :) &
     timer_pid=$!
     result=0
     wait "$probe_pid" || result=$?
@@ -112,8 +127,10 @@ has_nvidia() {
 }
 
 if [ "$remove" = 1 ]; then
-    [ -f "$install_dir/current/install-receipt.json" ] || fail "no standalone installation at $install_dir"
-    cp -R "$install_dir/current" "$staging/zg"
+    source_dir="$install_dir/current"
+    if [ -f "$install_dir/pending.json" ] && [ -f "$install_dir/previous/install-receipt.json" ]; then source_dir="$install_dir/previous"; fi
+    [ -f "$source_dir/install-receipt.json" ] || fail "no standalone installation at $install_dir"
+    cp -R "$source_dir" "$staging/zg"
 else
     command -v tar >/dev/null 2>&1 || fail "tar is required"
     if [ -n "$version" ]; then manifest_url="$base_url/download/rust-v$version/manifest.tsv"
@@ -157,10 +174,10 @@ else
     tar -tvzf "$staging/archive.tar.gz" > "$staging/types"
     LC_ALL=C awk 'substr($0,1,1)!="-" && substr($0,1,1)!="d" {exit 1}' "$staging/types" || fail "archive contains links or special files"
     tar -xzf "$staging/archive.tar.gz" -C "$staging"
-    [ "$("$staging/zg/bin/zg" --version)" = "$version" ] || fail "staged executable version mismatch"
+    check_version "$staging/zg/bin/zg" "$version" || fail "staged executable version check failed or timed out"
 fi
 
-set -- --standalone --install-dir "$install_dir" --accelerator "$accelerator" --no-modify-path --launcher "$HOME/.local/bin/zg"
+set -- --standalone --install-dir "$install_dir" --accelerator "$accelerator" --repository "$repository" --no-modify-path --launcher "$HOME/.local/bin/zg"
 [ "$remove" = 0 ] || set -- "$@" --remove
 [ "$skip_agents" = 0 ] || set -- "$@" --skip-agent-upgrade
 [ -z "$daemon_home" ] || set -- "$@" --home "$daemon_home"

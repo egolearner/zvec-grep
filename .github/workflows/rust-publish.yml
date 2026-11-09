@@ -599,6 +599,9 @@ jobs:
 
   standalone-publish:
     name: Publish verified standalone assets to GitHub Releases
+    concurrency:
+      group: standalone-latest
+      cancel-in-progress: false
     if: >-
       ${{ !cancelled() && github.repository == 'zvec-ai/zvec-grep' && inputs.publish &&
           inputs.dist_tag == 'latest' && needs.promote.result == 'success' &&

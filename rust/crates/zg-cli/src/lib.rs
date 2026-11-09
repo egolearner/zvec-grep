@@ -226,6 +226,7 @@ pub struct InstallArgs {
 }
 
 #[derive(Clone, Debug, Args)]
+#[allow(clippy::struct_excessive_bools)] // Independent installer options map directly to CLI switches.
 pub struct StandaloneArgs {
     #[arg(long)]
     pub install_dir: PathBuf,
@@ -241,6 +242,10 @@ pub struct StandaloneArgs {
     pub skip_agent_upgrade: bool,
     #[arg(long)]
     pub no_modify_path: bool,
+    #[arg(long)]
+    pub path_managed: bool,
+    #[arg(long, default_value = "zvec-ai/zvec-grep")]
+    pub repository: String,
     #[arg(long)]
     pub remove: bool,
 }
@@ -1059,6 +1064,7 @@ fn management_option_with_value(text: &str) -> bool {
             | "--launcher"
             | "--install-dir"
             | "--accelerator"
+            | "--repository"
     )
 }
 

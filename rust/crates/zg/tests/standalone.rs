@@ -40,6 +40,7 @@ struct Fixture {
     bundle: PathBuf,
     install: PathBuf,
     home: PathBuf,
+    token: Option<String>,
 }
 
 impl Fixture {
@@ -61,6 +62,7 @@ impl Fixture {
             bundle,
             install,
             home,
+            token: None,
         };
         fixture.write_manifest("first");
         fixture
@@ -116,11 +118,16 @@ impl Fixture {
         command
             .env("ZVEC_GREP_HOME", &self.home)
             .env("HOME", self.root.path())
-            .env("USERPROFILE", self.root.path());
+            .env("USERPROFILE", self.root.path())
+            .env_remove("ZVEC_GREP_SERVER_TOKEN")
+            .env_remove("ZVEC_GREP_SERVER_TOKEN_FILE");
+        if let Some(token) = &self.token {
+            command.env("ZVEC_GREP_SERVER_TOKEN", token);
+        }
         command
     }
 
-    fn install(&self) -> Output {
+    fn install_command(&self) -> Command {
         let mut command = self.command(&executable_path(&self.bundle));
         command
             .args(["--standalone", "--install-dir"])
@@ -135,9 +142,12 @@ impl Fixture {
                 "--skip-agent-upgrade",
             ])
             .arg("--home")
-            .arg(&self.home)
-            .output()
-            .expect("install")
+            .arg(&self.home);
+        command
+    }
+
+    fn install(&self) -> Output {
+        self.install_command().output().expect("install")
     }
 
     fn installed(&self) -> PathBuf {
@@ -274,7 +284,7 @@ fn standalone_upgrade_restarts_owned_daemon_preserves_data_and_recovers_interrup
     .expect("interrupted move");
     fs::write(fixture.install.join("pending.json"), serde_json::to_vec(&json!({
         "hadPrevious": true, "home": fixture.home,
-        "restart": { "home": fixture.home, "listen": address, "toolset": "agent", "tokenFile": null }
+        "restart": { "home": fixture.home, "listen": address, "toolset": "agent", "tokenFile": null, "authenticationRequired": false }
     })).expect("journal")).expect("write journal");
     success(fixture.install());
     assert!(!fixture.install.join("pending.json").exists());
@@ -297,6 +307,118 @@ fn standalone_upgrade_restarts_owned_daemon_preserves_data_and_recovers_interrup
             .expect("uninstall"),
     );
     assert!(!fixture.installed().exists());
+    #[cfg(unix)]
+    assert!(fs::symlink_metadata(fixture.launcher()).is_err());
+    assert_eq!(
+        fs::read_to_string(fixture.home.join("user-data")).expect("preserved data"),
+        "keep"
+    );
+}
+
+#[test]
+fn interrupted_authenticated_installation_requires_credentials_before_restarting() {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let mut fixture = Fixture::new();
+    success(fixture.install());
+    fixture.token = Some("standalone-regression-token-at-least-32-characters".to_owned());
+    let listener = TcpListener::bind("127.0.0.1:0").expect("port");
+    let address = listener.local_addr().expect("address").to_string();
+    drop(listener);
+    let anonymous_status = || {
+        let mut stream = TcpStream::connect(&address).expect("daemon connection");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        write!(stream, "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("response");
+        response.lines().next().expect("status").to_owned()
+    };
+    success(
+        fixture
+            .command(&fixture.installed())
+            .args(["--server", "on", "--listen", &address, "--home"])
+            .arg(&fixture.home)
+            .output()
+            .expect("start"),
+    );
+    assert!(anonymous_status().contains("401"));
+    // Missing credentials must fail before creating a journal or stopping the service.
+    let denied = fixture
+        .install_command()
+        .env_remove("ZVEC_GREP_SERVER_TOKEN")
+        .output()
+        .expect("missing credentials");
+    assert!(!denied.status.success());
+    assert!(!fixture.install.join("pending.json").exists());
+    assert!(anonymous_status().contains("401"));
+    success(
+        fixture
+            .command(&fixture.installed())
+            .args(["--server", "off", "--home"])
+            .arg(&fixture.home)
+            .output()
+            .expect("stop"),
+    );
+    fs::rename(
+        fixture.install.join("current"),
+        fixture.install.join("previous"),
+    )
+    .expect("interrupted move");
+    fs::write(fixture.install.join("pending.json"), serde_json::to_vec(&json!({
+        "hadPrevious": true, "home": fixture.home,
+        "restart": { "home": fixture.home, "listen": address, "toolset": "agent", "tokenFile": null, "authenticationRequired": true }
+    })).expect("journal")).expect("write journal");
+    let denied = fixture
+        .install_command()
+        .env_remove("ZVEC_GREP_SERVER_TOKEN")
+        .output()
+        .expect("recovery without token");
+    assert!(!denied.status.success());
+    assert!(
+        String::from_utf8_lossy(&denied.stderr)
+            .contains("recovery requires the daemon authentication token")
+    );
+    assert!(TcpStream::connect(&address).is_err());
+    assert!(fixture.install.join("pending.json").exists());
+    assert!(fixture.install.join("previous").exists());
+    success(fixture.install());
+    assert!(anonymous_status().contains("401"));
+    assert!(!fixture.install.join("pending.json").exists());
+}
+
+#[test]
+fn standalone_uninstall_recovers_an_interrupted_directory_move() {
+    let fixture = Fixture::new();
+    success(fixture.install());
+    fs::write(fixture.home.join("user-data"), "keep").expect("data");
+    fs::rename(
+        fixture.install.join("current"),
+        fixture.install.join("previous"),
+    )
+    .expect("move");
+    fs::write(
+        fixture.install.join("pending.json"),
+        serde_json::to_vec(&json!({
+            "hadPrevious": true, "home": fixture.home, "restart": null
+        }))
+        .expect("journal"),
+    )
+    .expect("write journal");
+    success(
+        fixture
+            .command(&executable_path(&fixture.bundle))
+            .args(["--standalone", "--remove", "--install-dir"])
+            .arg(&fixture.install)
+            .output()
+            .expect("recover and remove"),
+    );
+    for name in ["current", "previous", "next", "pending.json"] {
+        assert!(!fixture.install.join(name).exists(), "{name}");
+    }
     #[cfg(unix)]
     assert!(fs::symlink_metadata(fixture.launcher()).is_err());
     assert_eq!(

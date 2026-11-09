@@ -27,7 +27,11 @@ if (Test-Path -LiteralPath $statePath) {
         if ($fields.Length -eq 2) { $state[$fields[0]] = $fields[1] }
     }
 }
-$BaseUrl = 'https://github.com/zvec-ai/zvec-grep/releases'
+$repository = $env:ZG_INSTALL_REPOSITORY
+if (-not $repository) { $repository = $state['repository'] }
+if (-not $repository) { $repository = 'zvec-ai/zvec-grep' }
+if ($repository -notmatch '^[A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_-][A-Za-z0-9_.-]*$') { throw 'Repository must be a GitHub owner/name.' }
+$BaseUrl = "https://github.com/$repository/releases"
 # Tests emulate the fixed GitHub download paths without changing the installed source.
 if ($env:ZG_INSTALL_TEST_RELEASE_URL) {
     if ($env:ZG_INSTALL_TEST_RELEASE_URL -notmatch '^http://127\.0\.0\.1:\d+$') { throw 'Invalid test release server.' }
@@ -75,9 +79,41 @@ function Has-Nvidia {
     } finally { $process.Dispose() }
 }
 
+function Get-UpdatedUserPath([string]$UserPath, [string]$PathDir, [bool]$Remove, [bool]$ChangePath, [bool]$Managed) {
+    if (-not $ChangePath -or ($Remove -and -not $Managed)) { return $null }
+    $parts = @($UserPath -split ';' | Where-Object { $_ -and $_.TrimEnd('\') -ne $PathDir })
+    if (-not $Remove) { $parts = @($PathDir) + $parts }
+    return ($parts -join ';')
+}
+
+function Test-StagedVersion([string]$Executable, [string]$Expected) {
+    $start = New-Object Diagnostics.ProcessStartInfo
+    $start.FileName = $Executable
+    $start.Arguments = '--version'
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $start
+    try {
+        $process.Start() | Out-Null
+        $output = $process.StandardOutput.ReadToEndAsync()
+        $errors = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(10000)) {
+            $process.Kill()
+            $process.WaitForExit()
+            throw 'Staged executable version check timed out.'
+        }
+        if ($process.ExitCode -ne 0 -or $output.GetAwaiter().GetResult().Trim() -ne $Expected) { throw 'Staged executable version mismatch.' }
+    } finally { $process.Dispose() }
+}
+
 try {
     if ($Uninstall) {
         $current = Join-Path $InstallDir 'current'
+        $previous = Join-Path $InstallDir 'previous'
+        if ((Test-Path -LiteralPath (Join-Path $InstallDir 'pending.json')) -and (Test-Path -LiteralPath (Join-Path $previous 'install-receipt.json'))) { $current = $previous }
         if (-not (Test-Path -LiteralPath (Join-Path $current 'install-receipt.json'))) { throw 'No standalone installation found.' }
         Copy-Item -LiteralPath $current -Destination (Join-Path $staging 'zg') -Recurse
     } else {
@@ -124,10 +160,14 @@ try {
                 }
             }
         } finally { $zip.Dispose() }
-        $actualVersion = & (Join-Path $staging 'zg\bin\zg.exe') --version
-        if ($LASTEXITCODE -ne 0 -or $actualVersion.Trim() -ne $Version) { throw 'Staged executable version mismatch.' }
+        Test-StagedVersion (Join-Path $staging 'zg\bin\zg.exe') $Version
     }
-    $arguments = @('--standalone', '--install-dir', $InstallDir, '--accelerator', $Accelerator)
+    $pathDir = Join-Path $InstallDir 'current\bin'
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $alreadyOnPath = @($userPath -split ';' | Where-Object { $_.TrimEnd('\') -eq $pathDir }).Count -gt 0
+    $managedPath = $state['path_managed'] -eq '1' -or ($changePath -and -not $Uninstall -and -not $alreadyOnPath)
+    $arguments = @('--standalone', '--install-dir', $InstallDir, '--accelerator', $Accelerator, '--repository', $repository)
+    if ($managedPath) { $arguments += '--path-managed' }
     if ($Uninstall) { $arguments += '--remove' }
     if (-not $changePath) { $arguments += '--no-modify-path' }
     if ($skipAgents) { $arguments += '--skip-agent-upgrade' }
@@ -135,14 +175,11 @@ try {
     if ($TokenFile) { $arguments += @('--token-file', $TokenFile) }
     & (Join-Path $staging 'zg\bin\zg.exe') @arguments
     if ($LASTEXITCODE -ne 0) { throw 'Standalone activation failed; the previous installation was retained or recovery instructions were printed above.' }
-    $pathDir = Join-Path $InstallDir 'current\bin'
-    if ($Uninstall -or $changePath) {
-        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-        $parts = @($userPath -split ';' | Where-Object { $_ -and $_.TrimEnd('\') -ne $pathDir })
-        if (-not $Uninstall) { $parts = @($pathDir) + $parts }
-        [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User')
+    $updatedPath = Get-UpdatedUserPath ([Environment]::GetEnvironmentVariable('Path', 'User')) $pathDir $Uninstall $changePath $managedPath
+    if ($null -ne $updatedPath) {
+        [Environment]::SetEnvironmentVariable('Path', $updatedPath, 'User')
         Write-Host 'Open a new terminal and reconnect existing MCP clients.'
-    } else { Write-Host "Add $pathDir to PATH to use zg." }
+    } elseif (-not $Uninstall) { Write-Host "Add $pathDir to PATH to use zg." }
     $existing = Get-Command zg -ErrorAction SilentlyContinue
     if (-not $Uninstall -and $existing -and $existing.Source -ne (Join-Path $pathDir 'zg.exe')) { Write-Warning "The current shell resolves zg to $($existing.Source); check PATH before using the new installation." }
 } finally {

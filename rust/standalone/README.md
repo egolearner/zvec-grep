@@ -1,7 +1,7 @@
 # Standalone installation from GitHub Releases
 
 The standalone distribution uses the Rust native build and does not require Node.js
-or npm on the user's machine. Its only download source is the official
+or npm on the user's machine. Its default download source is the official
 [`zvec-ai/zvec-grep` GitHub Releases](https://github.com/zvec-ai/zvec-grep/releases).
 The commands below become available when the updated release workflow publishes
 its first standalone release; adding the installer files to the repository alone
@@ -56,6 +56,18 @@ PATH preference persist across upgrades. A custom directory must be passed again
 directories to discover installations. Initial installation into an unrelated,
 nonempty directory is rejected.
 
+To test a fork, set `ZG_INSTALL_REPOSITORY=owner/repository`. Only GitHub Releases
+are supported; the repository is recorded and reused on subsequent installs.
+Download the installer from that same repository and use `--version`/`-Version`
+for a preview release, because GitHub's Latest endpoint excludes prereleases.
+For example, a published `rust-v0.3.0` preview in `egolearner/zvec-grep` can be tested with:
+
+```sh
+curl -fsSL https://github.com/egolearner/zvec-grep/releases/download/rust-v0.3.0/install.sh | ZG_INSTALL_REPOSITORY=egolearner/zvec-grep sh -s -- --version 0.3.0
+```
+
+`ZG_INSTALL_REPOSITORY` never accepts a URL, host, or path outside a GitHub repository.
+
 Unix needs a POSIX shell, curl or wget, tar, standard text utilities, and either
 sha256sum or shasum. Windows uses PowerShell and .NET ZIP/hash support. No compiler,
 Python, jq or package manager runs during installation.
@@ -92,6 +104,9 @@ reuse it and uninstall only removes it if it still points to this installation.
 Windows keeps its native executable entry and updates User PATH unless
 `-NoModifyPath` is selected. Open a new terminal afterwards. Its installer does
 not create Unix-style command symlinks. npm-owned files are never overwritten.
+Uninstall respects the saved PATH opt-out and an explicit `-NoModifyPath`.
+It removes an entry only when the installer added it; pre-existing user entries
+are preserved.
 
 ## Platforms and GPU behavior
 
@@ -141,6 +156,11 @@ claim, then gracefully stops only a process whose executable belongs to this
 installation. Other installations sharing that daemon home cause an explicit
 error; stop them yourself before switching channels. Remote servers are not
 controlled by the installer. A protected daemon needs its existing token.
+Recovery records whether authentication is required, without storing token values.
+After an interruption, supply the original token environment or `--token-file`;
+missing credentials cannot restart a protected service anonymously. Saved token-file
+paths are reused. Older recovery journals without authentication metadata require
+credentials rather than assuming that anonymous startup is safe.
 
 The old directory is retained while the candidate becomes `current`. An active
 daemon restarts with its previous listen address and toolset. Failed activation
@@ -181,10 +201,12 @@ matching tag can publish standalone assets, after all required jobs succeed.
 
 The publisher verifies the complete eight-archive inventory, uploads assets to a
 draft GitHub Release, checks GitHub's asset sizes and SHA256 digests, and publishes
-Latest last. Retries accept identical already-published assets and never replace
-them or move Latest backwards. Partial platform runs are validation candidates
-only. No mirror, custom download source, object storage or additional installation
-channel is supported by these scripts.
+Latest last. Publication serializes the Latest comparison and update across tags.
+Retries accept identical already-published assets and never replace them; an older
+draft can be published without replacing a newer Latest. Partial platform runs are
+validation candidates only. Fork previews can be published separately for testing;
+the automated stable publisher remains restricted to the official repository.
+No mirror, object storage or non-GitHub installation channel is supported.
 
 The test harness uses a loopback HTTP server implementing the same GitHub URL
 layout; its private test override is restricted to loopback and is never saved

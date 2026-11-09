@@ -126,6 +126,7 @@ pub struct InstallationDaemon {
     executables: Vec<PathBuf>,
     token_file: Option<PathBuf>,
     config: Option<ServerConfig>,
+    authentication_required: bool,
 }
 
 impl InstallationDaemon {
@@ -139,17 +140,45 @@ impl InstallationDaemon {
         token_file: Option<&Path>,
     ) -> Result<Self, DaemonError> {
         let lock = StartupLock::acquire(home).await?;
+        let environment_file = std::env::var_os("ZVEC_GREP_SERVER_TOKEN_FILE").map(PathBuf::from);
+        let token_file = token_file.or(environment_file.as_deref());
         let mut guard = Self {
             _lock: lock,
             home: home.to_owned(),
             executables: executables.to_vec(),
             token_file: token_file.map(std::path::absolute).transpose()?,
             config: None,
+            authentication_required: false,
         };
         if let Some(record) = read_running_instance(home).await? {
             guard.verify_executable(&record)?;
             let mut config =
                 ServerConfig::new(record_address(&record, home).await?, home.to_owned());
+            // GET cannot shut down the service, but still crosses its authentication middleware.
+            let status = http_request(
+                &config.listen,
+                "GET",
+                "/control/shutdown",
+                HTTP_TIMEOUT,
+                None,
+            )
+            .await?;
+            guard.authentication_required = match status {
+                401 => true,
+                405 => false,
+                _ => {
+                    return Err(DaemonError::McpBridge(format!(
+                        "unexpected daemon authentication response: {status}"
+                    )));
+                }
+            };
+            if guard.authentication_required
+                && crate::resolve_token(guard.token_file.as_deref())?.is_none()
+            {
+                return Err(DaemonError::McpBridge(
+                    "the installed daemon requires its existing authentication token".into(),
+                ));
+            }
             config.token_file.clone_from(&guard.token_file);
             config.mcp_toolset = Some(match record.mcp_toolset.as_str() {
                 "full" => crate::McpToolset::Full,
@@ -163,6 +192,12 @@ impl InstallationDaemon {
     #[must_use]
     pub const fn config(&self) -> Option<&ServerConfig> {
         self.config.as_ref()
+    }
+
+    /// Whether restarting this installation must preserve authentication.
+    #[must_use]
+    pub const fn authentication_required(&self) -> bool {
+        self.authentication_required
     }
 
     fn verify_executable(&self, record: &DaemonInstanceRecord) -> Result<(), DaemonError> {
@@ -581,8 +616,15 @@ async fn start_server_with_lock(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let child = command.spawn()?;
-    wait_until_ready(&config.home, Some((child, log_path))).await
+    let mut child = (command.spawn()?, log_path);
+    let result = wait_until_ready(&config.home, Some(&mut child)).await;
+    // Installation recovery can stop this daemon again before the parent exits.
+    // Reap it even after readiness or startup failure, so zombies cannot look alive.
+    #[cfg(unix)]
+    std::thread::spawn(move || {
+        let _ = child.0.wait();
+    });
+    result
 }
 
 /// Requests graceful shutdown using an explicitly selected token file and falls
@@ -768,7 +810,7 @@ async fn remove_startup_record_if_same(
 
 async fn wait_until_ready(
     home: &Path,
-    mut child: Option<(DaemonChild, PathBuf)>,
+    mut child: Option<&mut (DaemonChild, PathBuf)>,
 ) -> Result<DaemonStatus, DaemonError> {
     let deadline = tokio::time::Instant::now() + START_TIMEOUT;
     loop {

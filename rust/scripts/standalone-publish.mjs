@@ -66,7 +66,20 @@ export async function publishStandaloneRelease({ directory, repository = process
   }
   gh(["release", "upload", release.tag, "--repo", repository, "--clobber", ...files.map((file) => join(directory, file))]);
   verifyRemote(JSON.parse(gh(["api", `repos/${repository}/releases/tags/${release.tag}`])));
-  gh(["release", "edit", release.tag, "--repo", repository, "--draft=false", "--latest", "--verify-tag"]);
+  let latest;
+  try { latest = JSON.parse(gh(["api", `repos/${repository}/releases/latest`])); }
+  catch (error) { if (!String(error.message).includes("404")) throw error; }
+  let promote = true;
+  if (latest) {
+    const match = latest.tag_name?.match(/^(?:rust-)?v?(\d+)\.(\d+)\.(\d+)$/);
+    if (!match) throw new Error("cannot safely compare the current Latest release version");
+    const current = match.slice(1).map(BigInt);
+    const candidate = release.version.split(".").map(BigInt);
+    const difference = candidate.findIndex((part, index) => part !== current[index]);
+    promote = difference >= 0 && candidate[difference] > current[difference];
+  }
+  // The workflow serializes this read and publication across all release tags.
+  gh(["release", "edit", release.tag, "--repo", repository, "--draft=false", `--latest=${promote}`, "--verify-tag"]);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
