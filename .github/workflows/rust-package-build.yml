@@ -122,8 +122,8 @@ jobs:
         with:
           path: rust/target/ort-prebuilt/
           key: rust-ort-1.21-${{ inputs.target }}-${{ hashFiles('rust/scripts/onnxruntime-distributions.json') }}
-      - name: Preserve the Intel macOS deployment target
-        if: inputs.target == 'darwin-x64'
+      - name: Preserve the macOS deployment target on newer runners
+        if: runner.os == 'macOS'
         run: echo "MACOSX_DEPLOYMENT_TARGET=14.0" >> "$GITHUB_ENV"
       - name: Build the Ubuntu 20.04 Rust builder without a CUDA compiler
         if: runner.os == 'Linux'
