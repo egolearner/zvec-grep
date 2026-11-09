@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$Version,
-    [ValidateSet('auto', 'cpu', 'cuda')][string]$Accelerator = $env:ZG_INSTALL_ACCELERATOR,
+    [string]$Accelerator = $env:ZG_INSTALL_ACCELERATOR,
     [string]$InstallDir = $env:ZG_INSTALL_DIR,
     [string]$DaemonHome,
     [string]$TokenFile,
@@ -39,7 +39,7 @@ if ($env:ZG_INSTALL_TEST_RELEASE_URL) {
 }
 if (-not $Accelerator) { $Accelerator = $state['accelerator'] }
 if (-not $Accelerator) { $Accelerator = 'auto' }
-if ($Accelerator -notin @('auto', 'cpu', 'cuda')) { throw 'Invalid accelerator in installation state.' }
+if ($Accelerator -notin @('auto', 'cpu', 'cuda')) { throw 'Accelerator must be auto, cpu, or cuda.' }
 if ($Version -and $Version -notmatch '^\d+\.\d+\.\d+(-[A-Za-z0-9.-]+)?$') { throw 'Invalid version.' }
 $changePath = -not $NoModifyPath -and ($ModifyPath -or $state['modify_path'] -ne '0')
 $skipAgents = $SkipAgentUpgrade -or $env:ZG_INSTALL_SKIP_AGENT_UPGRADE -eq '1' -or $env:CI -in @('true', '1')

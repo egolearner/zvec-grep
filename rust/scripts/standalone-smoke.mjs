@@ -22,7 +22,7 @@ async function freePort() {
   return port;
 }
 
-async function installerEnvironment(root) {
+export async function installerEnvironment(root) {
   const home = join(root, process.platform === "win32" ? "home" : "安装 with spaces");
   const temporary = join(root, "temporary");
   await mkdir(home, { recursive: true });
@@ -36,7 +36,7 @@ async function installerEnvironment(root) {
   } else {
     const bin = join(root, "system-tools");
     await mkdir(bin, { recursive: true });
-    for (const command of ["sh", "curl", "wget", "tar", "awk", "grep", "sed", "uname", "sw_vers", "sysctl", "getconf", "cut", "id", "mkdir", "mktemp", "rm", "cp", "cat", "sleep", "wc", "tr", "sha256sum", "shasum", "nvidia-smi"]) {
+    for (const command of ["sh", "curl", "wget", "tar", "gzip", "awk", "grep", "sed", "uname", "sw_vers", "sysctl", "getconf", "cut", "id", "mkdir", "mktemp", "rm", "cp", "cat", "sleep", "wc", "tr", "sha256sum", "shasum", "nvidia-smi"]) {
       const source = process.env.PATH.split(delimiter).map((path) => join(path, command)).find(existsSync);
       if (source && !existsSync(join(bin, command))) await symlink(source, join(bin, command));
     }

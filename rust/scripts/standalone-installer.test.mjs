@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { workspaceDir } from "./npm-package-core.mjs";
+import { installerEnvironment } from "./standalone-smoke.mjs";
 
 const execute = promisify(execFile);
 const shellInstaller = join(workspaceDir, "standalone/install.sh");
@@ -16,6 +17,19 @@ async function temporary(t) {
   t.after(() => rm(root, { recursive: true, force: true }));
   return root;
 }
+
+test("the Node-free smoke environment can extract gzip archives", { skip: process.platform === "win32" }, async (t) => {
+  const root = await temporary(t);
+  const env = await installerEnvironment(root);
+  await writeFile(join(root, "payload"), "native payload");
+  const archive = join(root, "payload.tar.gz");
+  await execute("tar", ["-czf", archive, "-C", root, "payload"]);
+  const output = join(root, "extracted");
+  await mkdir(output);
+  await execute("tar", ["-xzf", archive, "-C", output], { env });
+  assert.equal(await readFile(join(output, "payload"), "utf8"), "native payload");
+  await assert.rejects(execute("node", ["--version"], { env }), { code: "ENOENT" });
+});
 
 test("shell uninstall enters native recovery when only previous exists", { skip: process.platform === "win32" }, async (t) => {
   const root = await temporary(t);
@@ -130,12 +144,14 @@ test("PowerShell uninstall reaches the staged executable when current is missing
   await copyFile(process.execPath, join(install, "previous/bin/zg.exe"));
   await writeFile(join(install, "previous/install-receipt.json"), "{}");
   await writeFile(join(install, "pending.json"), "{}");
-  await assert.rejects(execute("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", powerShellInstaller,
-    "-InstallDir", install, "-Accelerator", "cpu", "-NoModifyPath", "-Uninstall"], {
-    env: { ...process.env, ZG_INSTALL_TMPDIR: root, ZG_INSTALL_REPOSITORY: "zvec-ai/zvec-grep" },
-  }), (error) => {
-    assert.match(error.stderr, /bad option: --standalone/);
-    assert.doesNotMatch(error.stderr, /No standalone installation found/);
-    return true;
-  });
+  for (const accelerator of [[], ["-Accelerator", "cpu"]]) {
+    await assert.rejects(execute("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", powerShellInstaller,
+      "-InstallDir", install, ...accelerator, "-NoModifyPath", "-Uninstall"], {
+      env: { ...process.env, ZG_INSTALL_TMPDIR: root, ZG_INSTALL_REPOSITORY: "zvec-ai/zvec-grep", ZG_INSTALL_ACCELERATOR: "" },
+    }), (error) => {
+      assert.match(error.stderr, /bad option: --standalone/);
+      assert.doesNotMatch(error.stderr, /No standalone installation found/);
+      return true;
+    });
+  }
 });

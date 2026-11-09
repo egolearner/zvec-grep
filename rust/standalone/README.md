@@ -68,7 +68,7 @@ curl -fsSL https://github.com/egolearner/zvec-grep/releases/download/rust-v0.3.0
 
 `ZG_INSTALL_REPOSITORY` never accepts a URL, host, or path outside a GitHub repository.
 
-Unix needs a POSIX shell, curl or wget, tar, standard text utilities, and either
+Unix needs a POSIX shell, curl or wget, tar with gzip support, standard text utilities, and either
 sha256sum or shasum. Windows uses PowerShell and .NET ZIP/hash support. No compiler,
 Python, jq or package manager runs during installation.
 
