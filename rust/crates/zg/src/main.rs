@@ -114,6 +114,8 @@ fn parse_cli() -> (Cli, Option<String>) {
     (cli, warning)
 }
 
+mod standalone;
+
 fn run() -> Result<ExitCode, Box<dyn Error>> {
     let (cli, warning) = parse_cli();
     let _ = OUTPUT_OPTIONS.set(cli.output_options());
@@ -144,6 +146,13 @@ fn run() -> Result<ExitCode, Box<dyn Error>> {
         }
         CliPlan::Install(args) if args.upgrade_installed => {
             zg_cli::execute_upgrade_installed(args)?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        CliPlan::Standalone(args) => {
+            Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(standalone::execute(args))?;
             return Ok(ExitCode::SUCCESS);
         }
         _ => {}
@@ -289,7 +298,7 @@ async fn execute_plan(plan: CliPlan) -> Result<ExitCode, Box<dyn Error>> {
         CliPlan::Server(plan) => execute_server_plan(plan).await,
         CliPlan::Install(args) => execute_install_plan(&args).await,
         CliPlan::Uninstall(args) => zg_cli::execute_uninstall(&args).map_err(Into::into),
-        CliPlan::Help(_) | CliPlan::Version => Ok(()),
+        CliPlan::Standalone(_) | CliPlan::Help(_) | CliPlan::Version => Ok(()),
     }?;
     Ok(ExitCode::SUCCESS)
 }

@@ -89,6 +89,13 @@ enum Launch {
 /// Reports unreadable, invalid or unsupported configurations after processing
 /// all independent files. Each changed file is backed up before replacement.
 pub fn execute_upgrade_installed(args: &InstallArgs) -> Result<(), InstallError> {
+    if let Some(launcher) = &args.launcher
+        && (!launcher.is_absolute() || !launcher.is_file())
+    {
+        return Err(InstallError::Message(
+            "--launcher must be an absolute path to an installed executable".to_owned(),
+        ));
+    }
     writeln!(
         crate::stdout(),
         "Upgrading existing integrations{}",
@@ -103,7 +110,13 @@ pub fn execute_upgrade_installed(args: &InstallArgs) -> Result<(), InstallError>
                 if !visited.insert((target.clone(), file.container)) {
                     return Ok(());
                 }
-                upgrade_file(&file, &target, args.dry_run, &mut report)
+                upgrade_file(
+                    &file,
+                    &target,
+                    args.dry_run,
+                    args.launcher.as_deref(),
+                    &mut report,
+                )
             })()
             .map_err(|error: InstallError| {
                 InstallError::Message(format!("{}: {error}", file.path.display()))
@@ -316,6 +329,7 @@ fn upgrade_file(
     file: &ConfigFile,
     target: &Path,
     dry_run: bool,
+    launcher: Option<&Path>,
     report: &mut Report,
 ) -> Result<(), InstallError> {
     let source = match fs::read_to_string(target) {
@@ -327,9 +341,9 @@ fn upgrade_file(
         return Ok(());
     }
     let (next, changes) = if matches!(file.format, Format::Toml) {
-        upgrade_toml(&source, &file.path, report)?
+        upgrade_toml(&source, &file.path, launcher, report)?
     } else {
-        upgrade_json(&source, file, report)?
+        upgrade_json(&source, file, launcher, report)?
     };
     if next != source {
         if !dry_run {
@@ -537,9 +551,61 @@ fn note_launch(
     Ok(())
 }
 
+fn installation_launch(name: &str, server: &Value, launcher: Option<&Path>) -> Launch {
+    let detected = launch(name, server);
+    let Some(launcher) = launcher else {
+        return detected;
+    };
+    let detected = match detected {
+        Launch::Update {
+            array,
+            action_index,
+            script,
+            ..
+        } => {
+            return Launch::Update {
+                array,
+                action_index,
+                script,
+                replace_executable: true,
+            };
+        }
+        Launch::Compatible => Launch::Compatible,
+        other => return other,
+    };
+    let (array, command, action_index) = match server.get("command") {
+        Some(Value::String(command)) => ("args", command.as_str(), 0),
+        Some(Value::Array(command)) => {
+            let Some(command) = command.first().and_then(Value::as_str) else {
+                return detected;
+            };
+            ("command", command, 1)
+        }
+        _ => return detected,
+    };
+    // HTTP integrations and unrelated launchers retain their existing routing.
+    if !zg_executable(command) || Path::new(command) == launcher {
+        return detected;
+    }
+    Launch::Update {
+        array,
+        action_index,
+        script: None,
+        replace_executable: true,
+    }
+}
+
+fn replacement_executable(launcher: Option<&Path>) -> Result<String, InstallError> {
+    Ok(launcher
+        .map_or_else(env::current_exe, |path| Ok(path.to_owned()))?
+        .to_string_lossy()
+        .into_owned())
+}
+
 fn upgrade_json(
     source: &str,
     file: &ConfigFile,
+    launcher: Option<&Path>,
     report: &mut Report,
 ) -> Result<(String, usize), InstallError> {
     let root = read_json_config(source, file)?;
@@ -552,7 +618,7 @@ fn upgrade_json(
     let mut next = source.to_owned();
     let mut upgraded = Vec::new();
     for (name, server) in servers {
-        let launch = launch(name, server);
+        let launch = installation_launch(name, server, launcher);
         note_launch(&file.path, name, &launch, report)?;
         if let Launch::Update {
             array,
@@ -570,7 +636,7 @@ fn upgrade_json(
                     .0;
             }
             if replace_executable {
-                let executable = env::current_exe()?.to_string_lossy().into_owned();
+                let executable = replacement_executable(launcher)?;
                 next = if array == "command" {
                     crate::jsonc::replace_array_string(&next, path, 0, &executable)
                         .map_err(|error| InstallError::Message(error.to_string()))?
@@ -595,7 +661,7 @@ fn upgrade_json(
                     .or_else(|| command.as_array()?.first()?.as_str())
             });
             let executable_matches = !replace_executable
-                || executable == Some(env::current_exe()?.to_string_lossy().as_ref());
+                || executable == Some(replacement_executable(launcher)?.as_str());
             if !executable_matches || !matches!(launch(name, server), Launch::Compatible) {
                 return Err(InstallError::Message(
                     "Ambiguous configuration properties; original file left unchanged.".to_owned(),
@@ -635,6 +701,7 @@ struct TomlServer {
 fn upgrade_toml(
     source: &str,
     path: &Path,
+    launcher: Option<&Path>,
     report: &mut Report,
 ) -> Result<(String, usize), InstallError> {
     let root: TomlConfig = toml::from_str(source)
@@ -658,7 +725,7 @@ fn upgrade_toml(
         if let Some(description) = &server.description {
             value.insert("description".to_owned(), json!(description));
         }
-        let launch = launch(&name, &Value::Object(value));
+        let launch = installation_launch(&name, &Value::Object(value), launcher);
         note_launch(path, &name, &launch, report)?;
         if let Launch::Update {
             action_index,
@@ -696,8 +763,7 @@ fn upgrade_toml(
                         .as_ref()
                         .expect("validated launch command")
                         .span(),
-                    toml::Value::String(env::current_exe()?.to_string_lossy().into_owned())
-                        .to_string(),
+                    toml::Value::String(replacement_executable(launcher)?).to_string(),
                 ));
             }
         }

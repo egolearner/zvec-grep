@@ -1,0 +1,191 @@
+# Standalone installation from GitHub Releases
+
+The standalone distribution uses the Rust native build and does not require Node.js
+or npm on the user's machine. Its only download source is the official
+[`zvec-ai/zvec-grep` GitHub Releases](https://github.com/zvec-ai/zvec-grep/releases).
+The commands below become available when the updated release workflow publishes
+its first standalone release; adding the installer files to the repository alone
+does not publish an installation endpoint.
+
+## Install and upgrade
+
+macOS and Linux:
+
+```sh
+curl -fsSL https://github.com/zvec-ai/zvec-grep/releases/latest/download/install.sh | sh
+```
+
+Run the same command again to upgrade. To select a specific published version:
+
+```sh
+curl -fsSL https://github.com/zvec-ai/zvec-grep/releases/latest/download/install.sh | sh -s -- --version 0.3.0
+```
+
+Windows PowerShell:
+
+```powershell
+Invoke-WebRequest -UseBasicParsing https://github.com/zvec-ai/zvec-grep/releases/latest/download/install.ps1 -OutFile install.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -Version 0.3.0
+```
+
+The release manifest is resolved once and all archives then use the corresponding
+`rust-v<VERSION>` tag URL. An upgrade cannot mix archives from two Latest releases.
+Checksums and sizes are verified before extraction, followed by native file-level
+verification before activation. Downloads are HTTPS through GitHub and its asset
+redirects; no GitHub token is required for public downloads.
+
+Shell options and their PowerShell equivalents:
+
+| Shell | PowerShell | Meaning |
+| --- | --- | --- |
+| `--version VERSION` | `-Version VERSION` | Select a published version; omit for Latest |
+| `--accelerator auto\|cpu\|cuda` | `-Accelerator auto\|cpu\|cuda` | Select optional NVIDIA components |
+| `--install-dir PATH` | `-InstallDir PATH` | Choose an installation directory |
+| `--home PATH` | `-DaemonHome PATH` | Select local daemon data; otherwise preserve the previous home |
+| `--token-file PATH` | `-TokenFile PATH` | Authenticate shutdown/restart of a protected local daemon |
+| Always user-managed | `-NoModifyPath` | Leave shell/User PATH unchanged |
+| — | `-ModifyPath` | Re-enable Windows User PATH setup after a previous opt-out |
+| `--skip-agent-upgrade` | `-SkipAgentUpgrade` | Leave existing integration launchers unchanged |
+| `--uninstall` | `-Uninstall` | Remove standalone binaries while retaining user data |
+
+`ZG_INSTALL_DIR`, `ZG_INSTALL_ACCELERATOR` and `ZG_INSTALL_SKIP_AGENT_UPGRADE=1`
+provide corresponding environment defaults. The selected accelerator and Windows
+PATH preference persist across upgrades. A custom directory must be passed again with
+`--install-dir`/`-InstallDir` (or `ZG_INSTALL_DIR`); the installer never scans other
+directories to discover installations. Initial installation into an unrelated,
+nonempty directory is rejected.
+
+Unix needs a POSIX shell, curl or wget, tar, standard text utilities, and either
+sha256sum or shasum. Windows uses PowerShell and .NET ZIP/hash support. No compiler,
+Python, jq or package manager runs during installation.
+
+On Unix, the complete program and upgrade state live under `~/.zvec-grep/bin`.
+The installer creates this absolute symlink to the stable executable:
+
+```text
+~/.local/bin/zg -> ~/.zvec-grep/bin/current/bin/zg
+```
+
+The shell installer never changes PATH or shell configuration files. If
+`~/.local/bin` is missing from the current PATH, installation still succeeds and
+prints commands to run and add to the user's chosen shell configuration. For
+Bash/zsh and other POSIX-compatible shells:
+
+```sh
+case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+```
+
+For fish, use `fish_add_path "$HOME/.local/bin"`. Verify command resolution with
+`command -v zg` and `zg --version`. An existing npm command may take precedence
+even when `~/.local/bin` is already on PATH; the installer reports that conflict.
+The earlier shell `--no-modify-path` spelling remains an accepted no-op.
+
+A custom `--install-dir` changes the link target while the command entry remains
+`~/.local/bin/zg`. An unrelated file or symlink at that entry is not overwritten;
+resolve it before retrying. The receipt records the owned launcher, so updates
+reuse it and uninstall only removes it if it still points to this installation.
+
+Windows keeps its native executable entry and updates User PATH unless
+`-NoModifyPath` is selected. Open a new terminal afterwards. Its installer does
+not create Unix-style command symlinks. npm-owned files are never overwritten.
+
+## Platforms and GPU behavior
+
+Six base packages cover macOS ARM64/x64, Linux glibc ARM64/x64 and Windows MSVC
+ARM64/x64. Linux requires glibc 2.31 or newer; Intel macOS requires macOS 14+.
+There are no musl, macOS CUDA or ARM64 CUDA packages. macOS base packages retain
+their existing Metal support; `cpu` here controls NVIDIA package installation,
+not runtime `--device` selection.
+
+Linux and Windows x64 additionally have complete CUDA archives. These use the
+same extensible CPU core, plus the exact GGUF CUDA 13.1/12.4 and ORT CUDA 12
+components. They contain no npm-specific ORT fragments.
+
+- `cpu` downloads only the base archive and performs no NVIDIA detection.
+- `auto` uses bounded `nvidia-smi` detection as a download hint. Failed optional
+  downloads retain the base installation path and report the fallback.
+- `cuda` explicitly requires the CUDA archive and fails on missing or corrupt
+  assets. It can preinstall plugins on a machine without a GPU.
+
+GPU detection does **not** prove driver, architecture, CUDA or cuDNN compatibility.
+Drivers and CUDA runtime/cuBLAS/cuDNN remain host dependencies, just as for npm.
+GGUF and ORT independently select their backends at runtime. Installation never
+installs a driver or downloads models to test GPU execution. Use the existing
+runtime diagnostics and `--device` controls to verify actual inference.
+
+## Installation state and recovery
+
+Default roots are `~/.zvec-grep/bin` on Unix and
+`%LOCALAPPDATA%\zvec-grep\standalone` on Windows. Each root contains:
+
+```text
+.zg-standalone          # Ownership marker
+.install.lock          # OS-held installation lock; no stale PID lock recovery
+current/bin/zg[.exe]    # Stable executable; the Unix command symlink targets it
+current/lib/           # Complete runtime libraries
+current/install-manifest.json
+current/install-receipt.json
+current/install-state.tsv
+previous/              # Last installation, retained until the next transaction
+next/                  # Fully verified candidate before activation
+pending.json           # Recovery journal, including command-link state
+```
+
+The binary invoked from staging performs the transaction on both OS families.
+It copies and verifies the new bundle before taking the local daemon startup
+claim, then gracefully stops only a process whose executable belongs to this
+installation. Other installations sharing that daemon home cause an explicit
+error; stop them yourself before switching channels. Remote servers are not
+controlled by the installer. A protected daemon needs its existing token.
+
+The old directory is retained while the candidate becomes `current`. An active
+daemon restarts with its previous listen address and toolset. Failed activation
+restores the old directory and service; an interrupted transaction is recovered
+when the installer next runs. Stop direct CLI processes before updating on
+Windows: locked EXE/DLL files can prevent directory replacement. The installer
+reports the failure and preserves recovery state if it cannot restore immediately.
+
+Existing supported integration launchers can be migrated to the stable absolute
+entry using `zg --install --upgrade-installed --launcher <ABSOLUTE_EXECUTABLE>`.
+The existing configuration backup and comment-preservation behavior is retained.
+Migration failures are reported without discarding a successfully installed
+runtime. CI, root/elevated installs and the explicit skip flag do not migrate
+personal integrations. Reconnect existing MCP/stdio clients after an upgrade.
+
+Configuration, models and indexes survive uninstall. The Unix default places
+programs in the managed `bin` subtree of `~/.zvec-grep`, leaving sibling data
+untouched. Other overlaps between data and program directories are rejected.
+Uninstall preserves `~/.local/bin`, shell configuration and user-maintained PATH
+entries. If the command symlink was replaced with another program, it is retained.
+Selecting an older release rolls back program files only: it does not undo an
+index or configuration format migration. There is no native self-update command
+in this first version; re-run the appropriate installer.
+
+## Release workflow
+
+`npm run release:standalone` assembles archives from the verified npm candidates,
+reuses their file/core/plugin checks, and preserves licenses and notices. Node
+and npm remain build-time tools. The output includes JSON and TSV manifests
+generated together, both installers and SHA256SUMS.
+
+`rust-publish.yml` uploads per-target candidate artifacts, runs the standalone
+install/update/failure/uninstall suite on all six CPU platforms with Node/npm
+removed from installer PATH, and checks standalone CUDA inference in the existing
+Linux/Windows GPU runtime environments. The normal npm gates remain in place.
+Only an explicit official-repository `publish=true, dist_tag=latest` run from the
+matching tag can publish standalone assets, after all required jobs succeed.
+
+The publisher verifies the complete eight-archive inventory, uploads assets to a
+draft GitHub Release, checks GitHub's asset sizes and SHA256 digests, and publishes
+Latest last. Retries accept identical already-published assets and never replace
+them or move Latest backwards. Partial platform runs are validation candidates
+only. No mirror, custom download source, object storage or additional installation
+channel is supported by these scripts.
+
+The test harness uses a loopback HTTP server implementing the same GitHub URL
+layout; its private test override is restricted to loopback and is never saved
+as an installed download source.

@@ -118,6 +118,113 @@ struct StartupLock {
     _held: HeldToken,
 }
 
+/// Holds the startup claim across an installation so bridges cannot restart the
+/// old executable between graceful shutdown and activation of the new bundle.
+pub struct InstallationDaemon {
+    _lock: StartupLock,
+    home: PathBuf,
+    executables: Vec<PathBuf>,
+    token_file: Option<PathBuf>,
+    config: Option<ServerConfig>,
+}
+
+impl InstallationDaemon {
+    /// Claims a local home and verifies that any running daemon belongs to this installation.
+    ///
+    /// # Errors
+    /// Returns ownership, locking, instance-record or configuration errors.
+    pub async fn acquire(
+        home: &Path,
+        executables: &[PathBuf],
+        token_file: Option<&Path>,
+    ) -> Result<Self, DaemonError> {
+        let lock = StartupLock::acquire(home).await?;
+        let mut guard = Self {
+            _lock: lock,
+            home: home.to_owned(),
+            executables: executables.to_vec(),
+            token_file: token_file.map(std::path::absolute).transpose()?,
+            config: None,
+        };
+        if let Some(record) = read_running_instance(home).await? {
+            guard.verify_executable(&record)?;
+            let mut config =
+                ServerConfig::new(record_address(&record, home).await?, home.to_owned());
+            config.token_file.clone_from(&guard.token_file);
+            config.mcp_toolset = Some(match record.mcp_toolset.as_str() {
+                "full" => crate::McpToolset::Full,
+                _ => crate::McpToolset::Agent,
+            });
+            guard.config = Some(config);
+        }
+        Ok(guard)
+    }
+
+    #[must_use]
+    pub const fn config(&self) -> Option<&ServerConfig> {
+        self.config.as_ref()
+    }
+
+    fn verify_executable(&self, record: &DaemonInstanceRecord) -> Result<(), DaemonError> {
+        let actual =
+            with_process(record.pid, |process| process.exe().map(Path::to_owned)).flatten();
+        let matches = actual
+            .as_ref()
+            .and_then(|path| path.canonicalize().ok())
+            .is_some_and(|actual| {
+                self.executables
+                    .iter()
+                    .any(|expected| expected.canonicalize().ok().as_ref() == Some(&actual))
+            });
+        if !matches {
+            return Err(DaemonError::InstallationConflict {
+                executable: actual
+                    .map_or_else(|| "unknown".to_owned(), |path| path.display().to_string()),
+            });
+        }
+        Ok(())
+    }
+
+    /// Stops only this installation's verified process, without signal escalation.
+    ///
+    /// # Errors
+    /// Returns identity, authentication, shutdown or timeout errors.
+    pub async fn stop(&self) -> Result<(), DaemonError> {
+        if let Some(record) = read_running_instance(&self.home).await? {
+            self.verify_executable(&record)?;
+            let token = crate::resolve_token(self.token_file.as_deref())?;
+            stop_recorded_server(
+                &self.home,
+                &record,
+                crate::default_stop_timeout(),
+                token.as_deref(),
+                StopMode::Graceful,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Restarts the previously active configuration while retaining the startup claim.
+    ///
+    /// # Errors
+    /// Returns startup, readiness or executable-identity errors.
+    pub async fn restart(
+        &self,
+        executable: &Path,
+        config: Option<&ServerConfig>,
+    ) -> Result<(), DaemonError> {
+        if let Some(config) = config {
+            start_server_with_lock(executable, config).await?;
+            let record = read_running_instance(&self.home)
+                .await?
+                .ok_or(DaemonError::Timeout { action: "start" })?;
+            self.verify_executable(&record)?;
+        }
+        Ok(())
+    }
+}
+
 impl StartupLock {
     async fn acquire(home: &Path) -> Result<Self, DaemonError> {
         let daemon_dir = daemon_dir(home);

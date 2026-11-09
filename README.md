@@ -66,6 +66,8 @@ terminal, or let your agent use it for you.
 
 ### 1. Set up a sample bookshelf
 
+For installation without Node/npm, see the [standalone GitHub Releases installer](rust/standalone/README.md), including upgrade and platform requirements. The download endpoints become available with the first standalone release.
+
 ```bash
 npm install -g @zvec/zvec-grep --allow-scripts=@zvec/zvec-grep
 

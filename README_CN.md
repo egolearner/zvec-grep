@@ -65,6 +65,8 @@
 
 ### 1. 准备示例书架
 
+无需 Node/npm 的安装方式见 [GitHub Releases 独立安装器](rust/standalone/README.md)，包含升级方式和平台要求；下载入口在首个独立版本发布后可用。
+
 ```bash
 npm install -g @zvec/zvec-grep --allow-scripts=@zvec/zvec-grep
 
