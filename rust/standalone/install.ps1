@@ -58,6 +58,13 @@ function Download([string]$Url, [string]$Destination) {
     Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $Destination -TimeoutSec 600
 }
 
+function Get-ArchiveSha256([string]$Path) {
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    $stream = [IO.File]::OpenRead($Path)
+    try { return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
+    finally { $stream.Dispose(); $algorithm.Dispose() }
+}
+
 function Has-Nvidia {
     $command = Get-Command nvidia-smi -ErrorAction SilentlyContinue
     if (-not $command) { return $false }
@@ -133,7 +140,7 @@ try {
             $asset = $assets[0]
             if ($asset.file -ne "zvec-grep-$Version-$target-$Selected.zip" -or $asset.sha256 -notmatch '^[a-f0-9]{64}$' -or $asset.bytes -le 0) { throw 'Invalid package metadata.' }
             Download "$BaseUrl/download/rust-v$Version/$($asset.file)" $archive
-            if ((Get-Item -LiteralPath $archive).Length -ne $asset.bytes -or (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $asset.sha256) { throw 'Package checksum mismatch.' }
+            if ((Get-Item -LiteralPath $archive).Length -ne $asset.bytes -or (Get-ArchiveSha256 $archive) -ne $asset.sha256) { throw 'Package checksum mismatch.' }
         }
         try { Fetch-Bundle $variant } catch {
             if ($Accelerator -ne 'auto' -or $variant -ne 'cuda') { throw }

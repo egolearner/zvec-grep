@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -17,6 +19,51 @@ async function temporary(t) {
   t.after(() => rm(root, { recursive: true, force: true }));
   return root;
 }
+
+test("PowerShell downloads, verifies and activates a ZIP with default options", { skip: process.platform !== "win32", timeout: 120000 }, async (t) => {
+  const root = await temporary(t);
+  const payload = join(root, "zg/bin");
+  await mkdir(payload, { recursive: true });
+  const compiler = join(root, "compile.ps1");
+  await writeFile(compiler, `Add-Type -OutputAssembly $env:REVIEW_EXECUTABLE -OutputType ConsoleApplication -TypeDefinition @'
+using System;
+public class InstallerFixture {
+    public static void Main(string[] args) {
+        Console.WriteLine(args.Length == 1 && args[0] == "--version" ? "1.2.3" : "native fixture activated");
+    }
+}
+'@\n`);
+  await execute("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", compiler], {
+    env: { ...process.env, REVIEW_EXECUTABLE: join(payload, "zg.exe") },
+  });
+  const archive = join(root, "payload.zip");
+  await execute("tar", ["-a", "-cf", archive, "-C", root, "zg"]);
+  const bytes = await readFile(archive);
+  const manifest = { schemaVersion: 1, version: "1.2.3", assets: ["x64", "arm64"].map((arch) => ({
+    target: `win32-${arch}-msvc`, accelerator: "cpu", file: `zvec-grep-1.2.3-win32-${arch}-msvc-cpu.zip`,
+    bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+  })) };
+  let corrupt = false;
+  const server = createServer((request, response) => {
+    if (request.url.endsWith("/manifest.json")) response.end(JSON.stringify(manifest));
+    else if (request.url.endsWith(".zip")) response.end(corrupt ? Buffer.alloc(bytes.length) : bytes);
+    else response.writeHead(404).end();
+  });
+  await new Promise((accept, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", accept); });
+  const env = { ...process.env, ZG_INSTALL_TMPDIR: root, ZG_INSTALL_REPOSITORY: "zvec-ai/zvec-grep", ZG_INSTALL_ACCELERATOR: "",
+    ZG_INSTALL_TEST_RELEASE_URL: `http://127.0.0.1:${server.address().port}`, CI: "true" };
+  const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", powerShellInstaller,
+    "-InstallDir", join(root, "安装 with spaces"), "-NoModifyPath", "-SkipAgentUpgrade"];
+  try {
+    const result = await execute("powershell.exe", args, { env, timeout: 45000 });
+    assert.match(result.stdout, /native fixture activated/);
+    corrupt = true;
+    await assert.rejects(execute("powershell.exe", args, { env, timeout: 45000 }), /Package checksum mismatch/);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((accept) => server.close(accept));
+  }
+});
 
 test("the Node-free smoke environment can extract gzip archives", { skip: process.platform === "win32" }, async (t) => {
   const root = await temporary(t);
