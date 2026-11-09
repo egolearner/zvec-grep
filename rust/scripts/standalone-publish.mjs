@@ -44,9 +44,14 @@ export async function publishStandaloneRelease({ directory, repository = process
   if (repository !== "zvec-ai/zvec-grep" || ref !== `refs/tags/${release.tag}` || commit !== release.commit) {
     throw new Error("standalone publication requires the official repository and the exact verified source tag/commit");
   }
-  let existing;
-  try { existing = JSON.parse(gh(["api", `repos/${repository}/releases/tags/${release.tag}`])); }
-  catch (error) { if (!String(error.message).includes("404")) throw error; }
+  const findRelease = () => {
+    try { return JSON.parse(gh(["api", `repos/${repository}/releases/tags/${release.tag}`])); }
+    catch (error) { if (!String(error.message).includes("404")) throw error; }
+    // The tag endpoint only returns published releases; draft retries need the authenticated list.
+    const pages = JSON.parse(gh(["api", `repos/${repository}/releases?per_page=100`, "--paginate", "--slurp"]));
+    return pages.flat().find((candidate) => candidate.tag_name === release.tag);
+  };
+  let existing = findRelease();
   const expectedAssets = await Promise.all(files.map(async (file) => ({ name: file,
     size: (await stat(join(directory, file))).size, digest: `sha256:${await sha256File(join(directory, file))}` })));
   const verifyRemote = (remote) => {
@@ -63,9 +68,11 @@ export async function publishStandaloneRelease({ directory, repository = process
     const notes = join(directory, "release-notes.md");
     await writeFile(notes, `Standalone zvec-grep ${release.version}.\n\nInstall or upgrade on macOS/Linux:\n\n\`\`\`sh\ncurl -fsSL https://github.com/zvec-ai/zvec-grep/releases/latest/download/install.sh | sh\n\`\`\`\n\nWindows: download and run install.ps1 from this release. Use --version (PowerShell: -Version) to select a release. CUDA packages require compatible NVIDIA drivers and host CUDA/cuBLAS/cuDNN libraries.\n`);
     gh(["release", "create", release.tag, "--repo", repository, "--draft", "--verify-tag", "--title", `zvec-grep ${release.version}`, "--notes-file", notes]);
+    existing = findRelease();
   }
+  if (!Number.isSafeInteger(existing?.id) || existing.id <= 0) throw new Error("cannot resolve the draft release ID");
   gh(["release", "upload", release.tag, "--repo", repository, "--clobber", ...files.map((file) => join(directory, file))]);
-  verifyRemote(JSON.parse(gh(["api", `repos/${repository}/releases/tags/${release.tag}`])));
+  verifyRemote(JSON.parse(gh(["api", `repos/${repository}/releases/${existing.id}`])));
   let latest;
   try { latest = JSON.parse(gh(["api", `repos/${repository}/releases/latest`])); }
   catch (error) { if (!String(error.message).includes("404")) throw error; }

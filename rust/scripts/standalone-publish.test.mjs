@@ -37,16 +37,38 @@ test("publication waits for a complete server-verified draft before promoting La
   const gh = (args) => {
     calls.push(args);
     if (args[0] === "api") {
-      if (args[1].endsWith("/latest")) throw new Error("HTTP 404: Not Found");
-      if (!created) throw new Error("HTTP 404: Not Found");
-      return JSON.stringify({ draft: true, assets: data.assets });
+      if (args[1].endsWith("/latest") || args[1].includes("/tags/")) throw new Error("HTTP 404: Not Found");
+      if (args[1].includes("?per_page=")) {
+        assert.ok(args.includes("--paginate") && args.includes("--slurp"));
+        return JSON.stringify([created ? [{ id: 123, tag_name: data.release.tag, draft: true }] : []]);
+      }
+      assert.ok(created);
+      assert.equal(args[1], `repos/${data.repository}/releases/123`);
+      return JSON.stringify({ id: 123, draft: true, assets: data.assets });
     }
     if (args[1] === "create") { created = true; assert.ok(args.includes("--draft")); }
     return "";
   };
   await publishStandaloneRelease({ ...data, gh });
-  assert.deepEqual(calls.map((args) => args[0] === "api" ? "verify" : args[1]), ["verify", "create", "upload", "verify", "verify", "edit"]);
+  assert.deepEqual(calls.filter((args) => args[0] === "release").map((args) => args[1]), ["create", "upload", "edit"]);
   assert.ok(calls.at(-1).includes("--latest=true"));
+});
+
+test("draft retries find the exact tag across pages without creating another release", async (t) => {
+  const data = await fixture(t);
+  const calls = [];
+  await publishStandaloneRelease({ ...data, gh: (args) => {
+    calls.push(args);
+    if (args[0] !== "api") return "";
+    if (args[1].includes("/tags/") || args[1].endsWith("/latest")) throw new Error("HTTP 404: Not Found");
+    if (args[1].includes("?per_page=")) return JSON.stringify([
+      [{ id: 99, tag_name: "rust-v9.9.9", draft: true }],
+      [{ id: 123, tag_name: data.release.tag, draft: true }],
+    ]);
+    assert.equal(args[1], `repos/${data.repository}/releases/123`);
+    return JSON.stringify({ id: 123, draft: true, assets: data.assets });
+  } });
+  assert.deepEqual(calls.filter((args) => args[0] === "release").map((args) => args[1]), ["upload", "edit"]);
 });
 
 test("retrying an older draft never demotes Latest and comparison errors fail closed", async (t) => {
@@ -55,7 +77,7 @@ test("retrying an older draft never demotes Latest and comparison errors fail cl
     const calls = [];
     await publishStandaloneRelease({ ...data, gh: (args) => {
       calls.push(args);
-      if (args[0] === "api") return JSON.stringify(args[1].endsWith("/latest") ? { tag_name: tag } : { draft: true, assets: data.assets });
+      if (args[0] === "api") return JSON.stringify(args[1].endsWith("/latest") ? { tag_name: tag } : { id: 123, draft: true, assets: data.assets });
       return "";
     } });
     assert.ok(calls.at(-1).includes(`--latest=${expected}`), tag);
@@ -68,7 +90,7 @@ test("retrying an older draft never demotes Latest and comparison errors fail cl
         if (error) throw error;
         return JSON.stringify({ tag_name: "unknown" });
       }
-      return JSON.stringify({ draft: true, assets: data.assets });
+      return JSON.stringify({ id: 123, draft: true, assets: data.assets });
     } }));
     assert.equal(calls.some((args) => args[1] === "edit"), false);
   }
@@ -79,7 +101,7 @@ test("incomplete uploads and unavailable API cannot publish or create an unverif
   const calls = [];
   await assert.rejects(publishStandaloneRelease({ ...data, gh: (args) => {
     calls.push(args);
-    return JSON.stringify({ draft: true, assets: data.assets.slice(1) });
+    return JSON.stringify({ id: 123, draft: true, assets: data.assets.slice(1) });
   } }), /digest mismatch/);
   assert.equal(calls.some((args) => args[1] === "edit"), false);
   calls.length = 0;
