@@ -50,7 +50,7 @@ $arch = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().
 if ($arch -notin @('x64', 'arm64')) { throw "Unsupported architecture: $arch" }
 $target = "win32-$arch-msvc"
 $tempBase = if ($env:ZG_INSTALL_TMPDIR) { $env:ZG_INSTALL_TMPDIR } else { [IO.Path]::GetTempPath() }
-$staging = Join-Path $tempBase ('zg-install-' + [Guid]::NewGuid().ToString('N'))
+$staging = [IO.Path]::GetFullPath((Join-Path $tempBase ('zg-install-' + [Guid]::NewGuid().ToString('N'))))
 [IO.Directory]::CreateDirectory($staging) | Out-Null
 
 function Download([string]$Url, [string]$Destination) {
