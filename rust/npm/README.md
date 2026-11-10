@@ -1,5 +1,11 @@
 # npm distribution
 
+The same verified native payloads also produce complete archives for the
+[standalone GitHub Releases installers](../standalone/README.md). These installers
+do not require Node/npm on user machines and keep their installation state separate
+from npm. Re-run the standalone installer to upgrade; npm installations continue
+to use npm.
+
 The release layout has one small meta package, one base native package for each
 published target, and exact-version CUDA component packages for Linux/Windows
 x64. `platforms.json` is the single source of truth for package
