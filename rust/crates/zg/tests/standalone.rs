@@ -48,10 +48,16 @@ impl Fixture {
         let root = tempfile::tempdir().expect("fixture");
         let bundle = root.path().join("bundle");
         let home = root.path().join("用户 data");
-        let install = home.join("bin");
+        let install = home.join("dist");
         fs::create_dir_all(bundle.join("bin")).expect("bin");
         let executable = Path::new(env!("CARGO_BIN_EXE_zg"));
         fs::copy(executable, executable_path(&bundle)).expect("binary");
+        #[cfg(windows)]
+        fs::copy(
+            env!("CARGO_BIN_EXE_zg-launcher"),
+            bundle.join("bin/zg-launcher.exe"),
+        )
+        .expect("native launcher");
         let profile = executable.parent().expect("profile");
         copy_libraries(profile, &bundle.join("lib"));
         if profile.join("lib").is_dir() {
@@ -69,6 +75,10 @@ impl Fixture {
     }
 
     fn write_manifest(&self, marker: &str) {
+        self.write_variant(marker, "cpu");
+    }
+
+    fn write_variant(&self, marker: &str, variant: &str) {
         fs::write(self.bundle.join("marker"), marker).expect("marker");
         let mut files = BTreeMap::new();
         for directory in [self.bundle.join("bin"), self.bundle.join("lib")] {
@@ -109,7 +119,7 @@ impl Fixture {
         };
         fs::write(self.bundle.join("install-manifest.json"), serde_json::to_vec(&json!({
             "schemaVersion": 1, "version": env!("CARGO_PKG_VERSION"), "target": format!("{os}-{arch}{abi}"),
-            "accelerator": "cpu", "files": files
+            "accelerator": variant, "files": files
         })).expect("manifest")).expect("write manifest");
     }
 
@@ -160,7 +170,11 @@ impl Fixture {
         #[cfg(unix)]
         command.arg("--launcher").arg(self.launcher());
         command
-            .args(["--accelerator", "cpu", "--no-modify-path"])
+            .args([
+                "--accelerator",
+                self.manifest()["accelerator"].as_str().expect("variant"),
+                "--no-modify-path",
+            ])
             .arg("--home")
             .arg(&self.home);
         command
@@ -170,15 +184,83 @@ impl Fixture {
         self.install_command().output().expect("install")
     }
 
+    fn manifest(&self) -> Value {
+        serde_json::from_slice(
+            &fs::read(self.bundle.join("install-manifest.json")).expect("manifest"),
+        )
+        .expect("JSON")
+    }
+
+    fn version_dir(&self, variant: &str) -> PathBuf {
+        self.install.join(env!("CARGO_PKG_VERSION")).join(format!(
+            "{}-{variant}",
+            self.manifest()["target"]
+                .as_str()
+                .expect("fixture operation")
+        ))
+    }
+
     fn installed(&self) -> PathBuf {
-        executable_path(&self.install.join("current"))
+        let receipt = fs::read(self.install.join("install-receipt.json"))
+            .ok()
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("fixture operation"));
+        executable_path(
+            &receipt
+                .and_then(|receipt| receipt["bundle"].as_str().map(|key| self.install.join(key)))
+                .unwrap_or_else(|| self.version_dir("cpu")),
+        )
+    }
+
+    fn activate(&self, variant: &str) -> Output {
+        self.command(&executable_path(&self.bundle))
+            .args([
+                "--standalone",
+                "--activate",
+                env!("CARGO_PKG_VERSION"),
+                "--accelerator",
+                variant,
+                "--skip-agent-upgrade",
+                "--install-dir",
+            ])
+            .arg(&self.install)
+            .output()
+            .expect("activate retained bundle")
+    }
+
+    fn interrupt(&self, restart: &Value, committed: bool) {
+        let receipt: Value = serde_json::from_slice(
+            &fs::read(self.install.join("install-receipt.json")).expect("fixture operation"),
+        )
+        .expect("fixture operation");
+        let bundles: Vec<_> = ["cpu", "cuda"]
+            .into_iter()
+            .filter(|variant| self.version_dir(variant).exists())
+            .map(|variant| {
+                format!(
+                    "{}/{}-{variant}",
+                    env!("CARGO_PKG_VERSION"),
+                    self.manifest()["target"]
+                        .as_str()
+                        .expect("fixture operation")
+                )
+            })
+            .collect();
+        let journal = json!({ "before": receipt, "after": null, "home": self.home.canonicalize().expect("fixture operation"),
+            "restart": restart, "entry": { "path": self.normalized_launcher(), "target": executable_path(&self.install.canonicalize().expect("fixture operation").join("current")),
+                "shim_sha256": receipt["launcherSha256"], "existed": true }, "bundles": bundles, "committed": committed });
+        fs::write(
+            self.install.join("activation.json"),
+            serde_json::to_vec(&journal).expect("fixture operation"),
+        )
+        .expect("fixture operation");
+        fs::remove_file(self.install.join("current")).expect("fixture operation");
     }
 
     fn launcher(&self) -> PathBuf {
         if cfg!(unix) {
             self.root.path().join(".local/bin/zg")
         } else {
-            self.installed()
+            executable_path(&self.install)
         }
     }
 
@@ -344,27 +426,40 @@ fn conflicting_launcher_keeps_the_daemon(fixture: &Fixture, pid: u64) {
     );
     fs::remove_file(fixture.launcher()).expect("remove fixture");
     std::os::unix::fs::symlink(
-        fixture.installed().canonicalize().expect("target"),
+        executable_path(
+            &fixture
+                .install
+                .canonicalize()
+                .expect("root")
+                .join("current"),
+        ),
         fixture.launcher(),
     )
     .expect("restore command link");
 }
 
 #[test]
-fn standalone_upgrade_restarts_owned_daemon_preserves_data_and_recovers_interruption() {
+fn standalone_switches_immutable_bundles_and_restarts_owned_daemon() {
     let fixture = Fixture::new();
     success(fixture.install());
     #[cfg(unix)]
     assert_eq!(
-        fs::read_link(fixture.launcher()).expect("command link"),
-        fixture
-            .installed()
-            .canonicalize()
-            .expect("installed binary")
+        fs::read_link(fixture.launcher()).expect("fixture operation"),
+        executable_path(
+            &fixture
+                .install
+                .canonicalize()
+                .expect("fixture operation")
+                .join("current")
+        )
     );
-    fs::write(fixture.home.join("user-data"), "keep").expect("data");
-    let socket = TcpListener::bind("127.0.0.1:0").expect("port");
-    let address = socket.local_addr().expect("address").to_string();
+    let original_binary = fixture
+        .installed()
+        .canonicalize()
+        .expect("fixture operation");
+    fs::write(fixture.home.join("user-data"), "keep").expect("fixture operation");
+    let socket = TcpListener::bind("127.0.0.1:0").expect("fixture operation");
+    let address = socket.local_addr().expect("fixture operation").to_string();
     drop(socket);
     success(
         fixture
@@ -372,82 +467,111 @@ fn standalone_upgrade_restarts_owned_daemon_preserves_data_and_recovers_interrup
             .args(["--server", "on", "--listen", &address, "--home"])
             .arg(&fixture.home)
             .output()
-            .expect("start"),
+            .expect("fixture operation"),
     );
     let first_instance = fixture.instance_token();
     let original_config = fixture.write_agent_config();
-    fixture.write_manifest("second");
+    fixture.write_variant("second", "cuda");
     success(
         fixture
             .install_with_agents_command()
             .output()
-            .expect("upgrade with agents"),
+            .expect("fixture operation"),
     );
     fixture.assert_agent_migrated(original_config);
     // Windows may reuse a PID immediately; the instance token identifies each daemon lifetime.
     assert_ne!(fixture.instance_token(), first_instance);
     assert_eq!(
-        fs::read_to_string(fixture.install.join("previous/marker")).expect("previous"),
+        fs::read_to_string(fixture.version_dir("cpu").join("marker")).expect("fixture operation"),
         "first"
     );
     assert_eq!(
-        fs::read_to_string(fixture.install.join("current/marker")).expect("current"),
+        fs::read_to_string(fixture.version_dir("cuda").join("marker")).expect("fixture operation"),
         "second"
     );
-    let second_pid = fixture.pid();
+    assert_ne!(
+        fixture
+            .installed()
+            .canonicalize()
+            .expect("fixture operation"),
+        original_binary
+    );
+    let upgraded_instance = fixture.instance_token();
+    success(fixture.activate("cpu"));
+    assert_eq!(
+        fixture
+            .installed()
+            .canonicalize()
+            .expect("fixture operation"),
+        original_binary
+    );
+    assert_ne!(fixture.instance_token(), upgraded_instance);
+    assert!(fixture.version_dir("cuda").exists());
     #[cfg(unix)]
-    conflicting_launcher_keeps_the_daemon(&fixture, second_pid);
-    fs::write(fixture.bundle.join("marker"), "corrupt").expect("tamper");
-    let output = fixture.install();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("checksum mismatch"));
-    assert_eq!(fixture.pid(), second_pid);
-    fixture.write_manifest("third");
+    conflicting_launcher_keeps_the_daemon(&fixture, fixture.pid());
+    fixture.write_variant("second", "cuda");
     success(
         fixture
-            .command(&fixture.installed())
+            .command(&fixture.launcher())
             .args(["--server", "off", "--home"])
             .arg(&fixture.home)
             .output()
-            .expect("stop"),
+            .expect("fixture operation"),
     );
-    fs::remove_dir_all(fixture.install.join("previous")).expect("remove old backup");
-    fs::rename(
-        fixture.install.join("current"),
-        fixture.install.join("previous"),
-    )
-    .expect("interrupted move");
-    fs::write(fixture.install.join("pending.json"), serde_json::to_vec(&json!({
-        "hadPrevious": true, "home": fixture.home,
-        "restart": { "home": fixture.home, "listen": address, "toolset": "agent", "tokenFile": null, "authenticationRequired": false }
-    })).expect("journal")).expect("write journal");
+    fixture.interrupt(&json!({ "home": fixture.home, "listen": address, "toolset": "agent", "tokenFile": null, "authenticationRequired": false }), false);
     success(fixture.install());
-    assert!(!fixture.install.join("pending.json").exists());
-    assert_eq!(
-        fs::read_to_string(fixture.install.join("previous/marker")).expect("recovered backup"),
-        "second"
-    );
-    assert_eq!(
-        fs::read_to_string(fixture.home.join("user-data")).expect("data"),
-        "keep"
-    );
+    assert!(!fixture.install.join("activation.json").exists());
     assert!(fixture.pid() > 0);
     success(
         fixture
-            .command(&executable_path(&fixture.bundle))
-            .args(["--standalone", "--install-dir"])
-            .arg(&fixture.install)
+            .install_command()
             .arg("--remove")
             .output()
-            .expect("uninstall"),
+            .expect("fixture operation"),
     );
-    assert!(!fixture.installed().exists());
-    #[cfg(unix)]
-    assert!(fs::symlink_metadata(fixture.launcher()).is_err());
+    for path in [
+        fixture.version_dir("cpu"),
+        fixture.version_dir("cuda"),
+        fixture.install.join("current"),
+        fixture.launcher(),
+    ] {
+        assert!(fs::symlink_metadata(path).is_err());
+    }
     assert_eq!(
-        fs::read_to_string(fixture.home.join("user-data")).expect("preserved data"),
+        fs::read_to_string(fixture.home.join("user-data")).expect("fixture operation"),
         "keep"
     );
+}
+
+#[test]
+fn tampered_download_keeps_the_selected_package() {
+    let fixture = Fixture::new();
+    success(fixture.install());
+    let selected = fixture.installed();
+    fs::write(fixture.bundle.join("marker"), "corrupt").expect("tamper download");
+    let output = fixture.install();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("checksum mismatch"));
+    assert_eq!(fixture.installed(), selected);
+    assert_eq!(
+        fs::read_to_string(fixture.version_dir("cpu").join("marker")).expect("original package"),
+        "first"
+    );
+}
+
+#[test]
+fn reinstalling_a_different_payload_cannot_overwrite_a_version_directory() {
+    let fixture = Fixture::new();
+    success(fixture.install());
+    fixture.write_manifest("changed");
+    let output = fixture.install();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("immutable version directories"));
+    assert_eq!(
+        fs::read_to_string(fixture.version_dir("cpu").join("marker")).expect("fixture operation"),
+        "first"
+    );
+    assert!(!fixture.install.join(".staging").exists());
 }
 
 #[test]
@@ -488,7 +612,7 @@ fn interrupted_authenticated_installation_requires_credentials_before_restarting
         .output()
         .expect("missing credentials");
     assert!(!denied.status.success());
-    assert!(!fixture.install.join("pending.json").exists());
+    assert!(!fixture.install.join("activation.json").exists());
     assert!(anonymous_status().contains("401"));
     success(
         fixture
@@ -498,15 +622,7 @@ fn interrupted_authenticated_installation_requires_credentials_before_restarting
             .output()
             .expect("stop"),
     );
-    fs::rename(
-        fixture.install.join("current"),
-        fixture.install.join("previous"),
-    )
-    .expect("interrupted move");
-    fs::write(fixture.install.join("pending.json"), serde_json::to_vec(&json!({
-        "hadPrevious": true, "home": fixture.home,
-        "restart": { "home": fixture.home, "listen": address, "toolset": "agent", "tokenFile": null, "authenticationRequired": true }
-    })).expect("journal")).expect("write journal");
+    fixture.interrupt(&json!({ "home": fixture.home, "listen": address, "toolset": "agent", "tokenFile": null, "authenticationRequired": true }), false);
     let denied = fixture
         .install_command()
         .env_remove("ZVEC_GREP_SERVER_TOKEN")
@@ -518,31 +634,20 @@ fn interrupted_authenticated_installation_requires_credentials_before_restarting
             .contains("recovery requires the daemon authentication token")
     );
     assert!(TcpStream::connect(&address).is_err());
-    assert!(fixture.install.join("pending.json").exists());
-    assert!(fixture.install.join("previous").exists());
+    assert!(fixture.install.join("activation.json").exists());
+    assert!(fixture.version_dir("cpu").exists());
     success(fixture.install());
     assert!(anonymous_status().contains("401"));
-    assert!(!fixture.install.join("pending.json").exists());
+    assert!(!fixture.install.join("activation.json").exists());
 }
 
 #[test]
-fn standalone_uninstall_recovers_an_interrupted_directory_move() {
+fn standalone_uninstall_resumes_committed_cleanup() {
     let fixture = Fixture::new();
     success(fixture.install());
     fs::write(fixture.home.join("user-data"), "keep").expect("data");
-    fs::rename(
-        fixture.install.join("current"),
-        fixture.install.join("previous"),
-    )
-    .expect("move");
-    fs::write(
-        fixture.install.join("pending.json"),
-        serde_json::to_vec(&json!({
-            "hadPrevious": true, "home": fixture.home, "restart": null
-        }))
-        .expect("journal"),
-    )
-    .expect("write journal");
+    fixture.interrupt(&Value::Null, true);
+    fs::remove_file(fixture.version_dir("cpu").join("marker")).expect("partial removal");
     success(
         fixture
             .command(&executable_path(&fixture.bundle))
@@ -551,7 +656,12 @@ fn standalone_uninstall_recovers_an_interrupted_directory_move() {
             .output()
             .expect("recover and remove"),
     );
-    for name in ["current", "previous", "next", "pending.json"] {
+    for name in [
+        "current",
+        ".staging",
+        "activation.json",
+        env!("CARGO_PKG_VERSION"),
+    ] {
         assert!(!fixture.install.join(name).exists(), "{name}");
     }
     #[cfg(unix)]
@@ -560,6 +670,30 @@ fn standalone_uninstall_recovers_an_interrupted_directory_move() {
         fs::read_to_string(fixture.home.join("user-data")).expect("preserved data"),
         "keep"
     );
+}
+
+#[test]
+fn uninstall_cleans_an_interrupted_first_activation() {
+    let fixture = Fixture::new();
+    success(fixture.install());
+    fixture.interrupt(&Value::Null, false);
+    let journal_path = fixture.install.join("activation.json");
+    let mut journal: Value =
+        serde_json::from_slice(&fs::read(&journal_path).expect("journal")).expect("JSON");
+    journal["after"] = journal["before"].take();
+    journal["entry"]["existed"] = json!(false);
+    fs::write(&journal_path, serde_json::to_vec(&journal).expect("JSON")).expect("journal");
+    fs::remove_file(fixture.install.join("install-receipt.json")).expect("receipt not committed");
+    success(
+        fixture
+            .install_command()
+            .arg("--remove")
+            .output()
+            .expect("recover first install"),
+    );
+    assert!(!fixture.version_dir("cpu").exists());
+    assert!(fs::symlink_metadata(fixture.launcher()).is_err());
+    assert!(!journal_path.exists());
 }
 
 #[cfg(unix)]
@@ -617,26 +751,14 @@ fn external_daemon_allows_install_and_recovery_but_only_previews_agent_migration
     fixture.assert_agent_unchanged(&original_bytes);
 
     // Recovery without an owned service must also leave the external daemon untouched.
-    fs::rename(
-        fixture.install.join("current"),
-        fixture.install.join("previous"),
-    )
-    .expect("interrupted move");
-    fs::write(
-        fixture.install.join("pending.json"),
-        serde_json::to_vec(&json!({
-            "hadPrevious": true, "home": fixture.home, "restart": null
-        }))
-        .expect("journal"),
-    )
-    .expect("write journal");
-    fixture.write_manifest("second");
+    fixture.interrupt(&Value::Null, false);
+    fixture.write_variant("second", "cuda");
     success(install_without_credentials());
-    assert!(!fixture.install.join("pending.json").exists());
+    assert!(!fixture.install.join("activation.json").exists());
     assert_eq!(fixture.instance_token(), instance);
     fixture.assert_agent_unchanged(&original_bytes);
     assert_eq!(
-        fs::read_to_string(fixture.install.join("current/marker")).expect("current"),
+        fs::read_to_string(fixture.version_dir("cuda").join("marker")).expect("current"),
         "second"
     );
 
@@ -670,18 +792,10 @@ fn external_daemon_allows_install_and_recovery_but_only_previews_agent_migration
 fn recovery_cannot_replace_an_external_daemon_when_owned_restart_is_pending() {
     let fixture = Fixture::new();
     success(fixture.install());
-    fs::rename(
-        fixture.install.join("current"),
-        fixture.install.join("previous"),
-    )
-    .expect("interrupted move");
     let socket = TcpListener::bind("127.0.0.1:0").expect("port");
     let address = socket.local_addr().expect("address").to_string();
     drop(socket);
-    fs::write(fixture.install.join("pending.json"), serde_json::to_vec(&json!({
-        "hadPrevious": true, "home": fixture.home,
-        "restart": { "home": fixture.home, "listen": address, "toolset": "agent", "tokenFile": null, "authenticationRequired": false }
-    })).expect("journal")).expect("write journal");
+    fixture.interrupt(&json!({ "home": fixture.home, "listen": address, "toolset": "agent", "tokenFile": null, "authenticationRequired": false }), false);
     success(
         fixture
             .command(Path::new(env!("CARGO_BIN_EXE_zg")))
@@ -695,40 +809,113 @@ fn recovery_cannot_replace_an_external_daemon_when_owned_restart_is_pending() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("another executable"));
     assert_eq!(fixture.instance_token(), instance);
-    assert!(fixture.install.join("pending.json").exists());
-    assert!(fixture.install.join("previous").exists());
+    assert!(fixture.install.join("activation.json").exists());
+    assert!(fixture.version_dir("cpu").exists());
     assert!(!fixture.install.join("current").exists());
 }
 
 #[test]
-fn daemon_running_from_previous_bundle_prevents_deleting_its_executable() {
+fn daemon_from_a_retained_bundle_is_managed_without_moving_its_files() {
     let fixture = Fixture::new();
     success(fixture.install());
-    fs::rename(
-        fixture.install.join("current"),
-        fixture.install.join("previous"),
-    )
-    .expect("move previous bundle");
-    let socket = TcpListener::bind("127.0.0.1:0").expect("port");
-    let address = socket.local_addr().expect("address").to_string();
+    fixture.write_variant("second", "cuda");
+    success(fixture.install());
+    success(fixture.activate("cpu"));
+    let socket = TcpListener::bind("127.0.0.1:0").expect("fixture operation");
+    let address = socket.local_addr().expect("fixture operation").to_string();
     drop(socket);
-    let executable = executable_path(&fixture.install.join("previous"));
+    let executable = executable_path(&fixture.version_dir("cuda"));
     success(
         fixture
             .command(&executable)
             .args(["--server", "on", "--listen", &address, "--home"])
             .arg(&fixture.home)
             .output()
-            .expect("start misplaced daemon"),
+            .expect("fixture operation"),
     );
     let instance = fixture.instance_token();
-    let output = fixture.install();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("another executable"));
-    assert_eq!(fixture.instance_token(), instance);
+    success(fixture.activate("cpu"));
+    assert_ne!(fixture.instance_token(), instance);
     assert!(executable.exists());
-    assert!(!fixture.install.join("pending.json").exists());
-    assert!(!fixture.install.join("next").exists());
+    assert!(fixture.installed().starts_with(fixture.version_dir("cpu")));
+}
+
+#[test]
+fn newly_installed_integrations_keep_the_fixed_command_across_version_switches() {
+    let fixture = Fixture::new();
+    success(fixture.install());
+    success(
+        fixture
+            .command(&fixture.launcher())
+            .args([
+                "--install",
+                "--yes",
+                "--target",
+                "cursor",
+                "--target",
+                "opencode",
+                "--mcp-transport",
+                "stdio",
+            ])
+            .env("ZVEC_GREP_INSTALL_SKIP_SERVER", "1")
+            .output()
+            .expect("new integrations"),
+    );
+    success(
+        fixture
+            .command(&fixture.launcher())
+            .args([
+                "--install",
+                "--yes",
+                "--target",
+                "cursor",
+                "--target",
+                "opencode",
+                "--mcp-transport",
+                "stdio",
+            ])
+            .env("ZVEC_GREP_INSTALL_SKIP_SERVER", "1")
+            .output()
+            .expect("idempotent integration install"),
+    );
+    let original = fs::read(fixture.agent_config()).expect("new configuration");
+    let config: Value = serde_json::from_slice(&original).expect("JSON");
+    assert_eq!(
+        config["mcpServers"]["zvec_grep"]["command"],
+        json!(fixture.normalized_launcher())
+    );
+    let array_path = fixture.root.path().join(".config/opencode/opencode.json");
+    let array_original = fs::read(&array_path).expect("command-array configuration");
+    let array_config: Value = serde_json::from_slice(&array_original).expect("JSON");
+    assert_eq!(
+        array_config["mcp"]["zvec_grep"]["command"][0],
+        json!(fixture.normalized_launcher())
+    );
+    fixture.write_variant("second", "cuda");
+    success(fixture.install());
+    success(fixture.activate("cpu"));
+    assert_eq!(
+        fs::read(fixture.agent_config()).expect("fixed configuration"),
+        original
+    );
+    assert_eq!(
+        fs::read(array_path).expect("fixed command array"),
+        array_original
+    );
+    success(
+        fixture
+            .command(&fixture.launcher())
+            .args([
+                "--uninstall",
+                "--yes",
+                "--target",
+                "cursor",
+                "--target",
+                "opencode",
+            ])
+            .output()
+            .expect("remove managed integrations"),
+    );
 }
 
 #[test]
@@ -744,7 +931,7 @@ fn agent_migration_failure_does_not_roll_back_a_successful_installation() {
     success(output);
     assert!(stderr.contains("migration needs attention"), "{stderr}");
     assert!(fixture.installed().exists());
-    assert!(!fixture.install.join("pending.json").exists());
+    assert!(!fixture.install.join("activation.json").exists());
     assert_eq!(
         fs::read_to_string(fixture.agent_config()).expect("config"),
         "{ invalid json"

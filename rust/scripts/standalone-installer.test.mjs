@@ -78,16 +78,15 @@ test("the Node-free smoke environment can extract gzip archives", { skip: proces
   await assert.rejects(execute("node", ["--version"], { env }), { code: "ENOENT" });
 });
 
-test("shell uninstall enters native recovery when only previous exists", { skip: process.platform === "win32" }, async (t) => {
+test("shell uninstall and offline activation use root state when current is missing", { skip: process.platform === "win32" }, async (t) => {
   const root = await temporary(t);
-  const install = join(root, "安装 with spaces/bin");
-  const executable = join(install, "previous/bin/zg");
+  const install = join(root, "安装 with spaces/dist");
+  const executable = join(install, "1.2.3/darwin-arm64-cpu/bin/zg");
   await mkdir(dirname(executable), { recursive: true });
-  await writeFile(executable, '#!/bin/sh\nprintf "%s\\n" "$@" > "$REVIEW_ARGUMENTS"\n');
+  await writeFile(executable, '#!/bin/sh\nif [ "$1" = --version ]; then printf 1.2.3; else printf "%s\\n" "$@" > "$REVIEW_ARGUMENTS"; fi\n');
   await chmod(executable, 0o755);
-  await writeFile(join(install, "previous/install-receipt.json"), "{}");
-  await writeFile(join(install, "previous/install-state.tsv"), "repository\tegolearner/zvec-grep\n");
-  await writeFile(join(install, "pending.json"), "{}");
+  await writeFile(join(install, "install-state.tsv"), "bundle\t1.2.3/darwin-arm64-cpu\nversion\t1.2.3\nrepository\tegolearner/zvec-grep\n");
+  await writeFile(join(install, "activation.json"), "{}");
   const output = join(root, "arguments");
   const env = { ...process.env, HOME: root, ZG_INSTALL_DIR: install, ZG_INSTALL_TMPDIR: root,
     ZG_INSTALL_REPOSITORY: "", ZG_INSTALL_ACCELERATOR: "cpu", REVIEW_ARGUMENTS: output };
@@ -95,6 +94,10 @@ test("shell uninstall enters native recovery when only previous exists", { skip:
   const args = (await readFile(output, "utf8")).split("\n");
   assert.ok(args.includes("--remove"));
   assert.equal(args[args.indexOf("--repository") + 1], "egolearner/zvec-grep");
+  await execute("sh", [shellInstaller, "--activate", "1.2.2"], { env });
+  const activation = (await readFile(output, "utf8")).split("\n");
+  assert.equal(activation[activation.indexOf("--activate") + 1], "1.2.2");
+  await assert.rejects(execute("sh", [shellInstaller, "--activate", "1.2.2", "--uninstall"], { env }), /cannot be combined/);
   for (const repository of ["https://example.com/repo", "owner/../repo", "../repo", "owner/repo?redirect=1"]) {
     await assert.rejects(execute("sh", [shellInstaller, "--uninstall"], { env: { ...env, ZG_INSTALL_REPOSITORY: repository } }), /GitHub owner\/name/);
   }
@@ -135,7 +138,7 @@ test("Windows PATH updates respect opt-out and command ownership", { skip: proce
   assert.ok(update);
   const script = join(root, "path-test.ps1");
   await writeFile(script, `${update}\n$ErrorActionPreference = 'Stop'
-$pathDir = 'C:\\Program Files\\zg\\current\\bin'
+$pathDir = 'C:\\Program Files\\zg\\bin'
 $original = "C:\\user;$pathDir;C:\\tools"
 foreach ($remove in @($true, $false)) {
     if ($null -ne (Get-UpdatedUserPath $original $pathDir $remove $false $true)) { throw 'Opt-out must leave PATH unchanged' }
@@ -186,11 +189,11 @@ test("PowerShell staged version checks accept only the expected executable versi
 test("PowerShell uninstall reaches the staged executable when current is missing", { skip: process.platform !== "win32" }, async (t) => {
   const root = await temporary(t);
   const install = join(root, "program");
-  await mkdir(join(install, "previous/bin"), { recursive: true });
-  // Node rejects the activation flag, proving that the previous bundle was staged and invoked.
-  await copyFile(process.execPath, join(install, "previous/bin/zg.exe"));
-  await writeFile(join(install, "previous/install-receipt.json"), "{}");
-  await writeFile(join(install, "pending.json"), "{}");
+  await mkdir(join(install, "1.2.3/win32-x64-msvc-cpu/bin"), { recursive: true });
+  // Node rejects the activation flag, proving that the retained bundle was staged and invoked.
+  await copyFile(process.execPath, join(install, "1.2.3/win32-x64-msvc-cpu/bin/zg.exe"));
+  await writeFile(join(install, "install-state.tsv"), `bundle\t1.2.3/win32-x64-msvc-cpu\nversion\t${process.version}\n`);
+  await writeFile(join(install, "activation.json"), "{}");
   for (const accelerator of [[], ["-Accelerator", "cpu"]]) {
     await assert.rejects(execute("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", powerShellInstaller,
       "-InstallDir", install, ...accelerator, "-NoModifyPath", "-Uninstall"], {

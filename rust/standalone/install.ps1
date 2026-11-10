@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$Version,
+    [string]$ActivateVersion,
     [string]$Accelerator = $env:ZG_INSTALL_ACCELERATOR,
     [string]$InstallDir = $env:ZG_INSTALL_DIR,
     [string]$DaemonHome,
@@ -17,10 +18,8 @@ if ($NoModifyPath -and $ModifyPath) { throw 'Choose either -NoModifyPath or -Mod
 if (-not $InstallDir) { $InstallDir = Join-Path $env:LOCALAPPDATA 'zvec-grep\standalone' }
 $InstallDir = [IO.Path]::GetFullPath($InstallDir)
 $state = @{}
-$statePath = Join-Path $InstallDir 'current\install-state.tsv'
-if ((Test-Path -LiteralPath (Join-Path $InstallDir 'pending.json')) -and (Test-Path -LiteralPath (Join-Path $InstallDir 'previous\install-state.tsv'))) {
-    $statePath = Join-Path $InstallDir 'previous\install-state.tsv'
-}
+if ($ActivateVersion -and ($Version -or $Uninstall)) { throw '-ActivateVersion cannot be combined with -Version or -Uninstall.' }
+$statePath = Join-Path $InstallDir 'install-state.tsv'
 if (Test-Path -LiteralPath $statePath) {
     foreach ($line in [IO.File]::ReadAllLines($statePath)) {
         $fields = $line.Split("`t")
@@ -117,13 +116,23 @@ function Test-StagedVersion([string]$Executable, [string]$Expected) {
 }
 
 try {
-    if ($Uninstall) {
-        $current = Join-Path $InstallDir 'current'
-        $previous = Join-Path $InstallDir 'previous'
-        if ((Test-Path -LiteralPath (Join-Path $InstallDir 'pending.json')) -and (Test-Path -LiteralPath (Join-Path $previous 'install-receipt.json'))) { $current = $previous }
-        if (-not (Test-Path -LiteralPath (Join-Path $current 'install-receipt.json'))) { throw 'No standalone installation found.' }
-        Copy-Item -LiteralPath $current -Destination (Join-Path $staging 'zg') -Recurse
-    } else {
+    $cached = $false
+    if ($Uninstall -or $ActivateVersion) {
+        $bundle = $state['bundle']
+        if ($bundle -notmatch '^\d+\.\d+\.\d+(-[A-Za-z0-9.-]+)?/[A-Za-z0-9-]+-(cpu|cuda)$') { throw 'No valid standalone installation found.' }
+        $source = Join-Path $InstallDir $bundle
+        if (Test-Path -LiteralPath (Join-Path $source 'bin\zg.exe')) {
+            Copy-Item -LiteralPath $source -Destination (Join-Path $staging 'zg') -Recurse
+            try { Test-StagedVersion (Join-Path $staging 'zg\bin\zg.exe') $state['version']; $cached = $true } catch { }
+        }
+        if (-not $cached) {
+            if ($ActivateVersion) { throw 'Cached executable is unavailable; repair the installation first.' }
+            # Resume a committed uninstall even after part of its cached runtime was deleted.
+            Remove-Item -LiteralPath (Join-Path $staging 'zg') -Recurse -Force -ErrorAction SilentlyContinue
+            $Version = $state['version']
+        }
+    }
+    if (-not $cached) {
         $manifestUrl = if ($Version) { "$BaseUrl/download/rust-v$Version/manifest.json" } else { "$BaseUrl/latest/download/manifest.json" }
         $manifestPath = Join-Path $staging 'manifest.json'
         Download $manifestUrl $manifestPath
@@ -169,13 +178,14 @@ try {
         } finally { $zip.Dispose() }
         Test-StagedVersion (Join-Path $staging 'zg\bin\zg.exe') $Version
     }
-    $pathDir = Join-Path $InstallDir 'current\bin'
+    $pathDir = Join-Path $InstallDir 'bin'
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $alreadyOnPath = @($userPath -split ';' | Where-Object { $_.TrimEnd('\') -eq $pathDir }).Count -gt 0
     $managedPath = $state['path_managed'] -eq '1' -or ($changePath -and -not $Uninstall -and -not $alreadyOnPath)
     $arguments = @('--standalone', '--install-dir', $InstallDir, '--accelerator', $Accelerator, '--repository', $repository)
     if ($managedPath) { $arguments += '--path-managed' }
     if ($Uninstall) { $arguments += '--remove' }
+    if ($ActivateVersion) { $arguments += @('--activate', $ActivateVersion) }
     if (-not $changePath) { $arguments += '--no-modify-path' }
     if ($skipAgents) { $arguments += '--skip-agent-upgrade' }
     if ($DaemonHome) { $arguments += @('--home', $DaemonHome) }

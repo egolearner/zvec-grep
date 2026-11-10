@@ -51,7 +51,7 @@ export async function smokeStandalone({ directory, prefixRoot, expectCuda = fals
   const inventory = JSON.parse(await readFile(join(directory, "manifest.json"), "utf8"));
   const entry = selectPlatform(loadReleaseManifest(), process.platform, process.arch, process.report?.getReport().header ?? {});
   const env = await installerEnvironment(prefixRoot);
-  const installDir = process.platform === "win32" ? join(prefixRoot, "安装 with spaces") : join(env.HOME, ".zvec-grep/bin");
+  const installDir = process.platform === "win32" ? join(prefixRoot, "安装 with spaces") : join(env.HOME, ".zvec-grep/dist");
   const profiles = [".profile", ".bashrc", ".bash_profile", ".zshrc", ".config/fish/config.fish"];
   const profileContent = "# Existing user shell configuration\n";
   for (const profile of profiles) {
@@ -77,8 +77,8 @@ export async function smokeStandalone({ directory, prefixRoot, expectCuda = fals
   await new Promise((accept, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", accept); });
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   env.ZG_INSTALL_TEST_RELEASE_URL = baseUrl;
-  const nativeBinary = join(installDir, "current/bin", entry.binary);
-  const binary = process.platform === "win32" ? nativeBinary : join(env.HOME, ".local/bin/zg");
+  const nativeBinary = join(installDir, inventory.version, `${entry.target}-cpu`, "bin", entry.binary);
+  const binary = process.platform === "win32" ? join(installDir, "bin", entry.binary) : join(env.HOME, ".local/bin/zg");
   const log = [];
   const invoke = async (command, args, environment = env) => {
     try {
@@ -90,11 +90,12 @@ export async function smokeStandalone({ directory, prefixRoot, expectCuda = fals
       throw error;
     }
   };
-  const install = async ({ accelerator, uninstall = false, version, onPath = false, shell } = {}) => {
+  const install = async ({ accelerator, uninstall = false, version, activate, onPath = false, shell } = {}) => {
     const args = process.platform === "win32"
       ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(directory, "install.ps1"), "-InstallDir", installDir, "-NoModifyPath", "-SkipAgentUpgrade"]
       : [join(directory, "install.sh"), "--skip-agent-upgrade"];
     const option = (unix, windows, value) => { args.push(process.platform === "win32" ? windows : unix); if (value !== undefined) args.push(value); };
+    if (activate) option("--activate", "-ActivateVersion", activate);
     if (version) option("--version", "-Version", version);
     if (accelerator) option("--accelerator", "-Accelerator", accelerator);
     if (uninstall) option("--uninstall", "-Uninstall");
@@ -105,11 +106,12 @@ export async function smokeStandalone({ directory, prefixRoot, expectCuda = fals
   try {
     const firstOutput = await install(expectCuda ? { accelerator: "cpu" } : {});
     if (process.platform !== "win32") {
-      assert.equal(await readlink(binary), await realpath(nativeBinary));
+      assert.equal(await readlink(binary), join(await realpath(installDir), "current/bin/zg"));
+      assert.equal(await realpath(binary), await realpath(nativeBinary));
       assert.match(firstOutput, /not in your current PATH/);
     }
     assert.equal((await invoke(binary, ["--version"])).trim(), inventory.version);
-    let receipt = JSON.parse(await readFile(join(installDir, "current/install-receipt.json"), "utf8"));
+    let receipt = JSON.parse(await readFile(join(installDir, "install-receipt.json"), "utf8"));
     assert.equal(receipt.acceleratorActual, "cpu");
     assert.equal(requests.some((path) => /-cuda\.(zip|tar.gz)$/.test(path)), false, "CPU installation must not download CUDA archives");
     const data = join(env.ZVEC_GREP_HOME, "user-data");
@@ -122,7 +124,7 @@ export async function smokeStandalone({ directory, prefixRoot, expectCuda = fals
     const upgradeOutput = await install({ ...(expectCuda ? { accelerator: "auto" } : {}), onPath: true });
     assert.doesNotMatch(upgradeOutput, /not in your current PATH/);
     assert.notEqual((await instance()).instanceToken, before.instanceToken, "upgrade must replace the old daemon");
-    receipt = JSON.parse(await readFile(join(installDir, "current/install-receipt.json"), "utf8"));
+    receipt = JSON.parse(await readFile(join(installDir, "install-receipt.json"), "utf8"));
     assert.equal(receipt.acceleratorActual, expectCuda ? "cuda" : "cpu");
     assert.equal(receipt.source, "https://github.com/zvec-ai/zvec-grep/releases");
     await invoke(binary, ["--server", "status", "--check-ready", "--home", env.ZVEC_GREP_HOME]);
@@ -131,6 +133,18 @@ export async function smokeStandalone({ directory, prefixRoot, expectCuda = fals
     const direct = await invoke(binary, ["--rg", "--mode", "direct", "-F", "standalone installation probe", corpus]);
     const automatic = await invoke(binary, ["--rg", "-F", "standalone installation probe", corpus]);
     assert.equal(direct, automatic);
+    const requestCount = requests.length;
+    const beforeRollback = await instance();
+    await install({ activate: inventory.version, accelerator: "cpu" });
+    assert.equal(requests.length, requestCount, "retained version activation must be offline");
+    assert.notEqual((await instance()).instanceToken, beforeRollback.instanceToken);
+    receipt = JSON.parse(await readFile(join(installDir, "install-receipt.json"), "utf8"));
+    assert.equal(receipt.acceleratorActual, "cpu");
+    if (expectCuda) {
+      assert.ok(existsSync(join(installDir, inventory.version, `${entry.target}-cuda`)));
+      await install({ activate: inventory.version, accelerator: "cuda" });
+      assert.equal(requests.length, requestCount);
+    }
     const active = await instance();
     corrupt = true;
     await assert.rejects(install(), /Command failed/);
@@ -150,7 +164,7 @@ export async function smokeStandalone({ directory, prefixRoot, expectCuda = fals
     }
     for (const profile of profiles) assert.equal(await readFile(join(env.HOME, profile), "utf8"), profileContent);
     await writeFile(join(prefixRoot, "results.json"), `${JSON.stringify({ passed: true, target: entry.target, version: inventory.version, expectCuda, requests, log }, null, 2)}\n`);
-    return { bundle: join(installDir, "current"), version: inventory.version };
+    return { bundle: join(installDir, inventory.version, `${entry.target}-${expectCuda ? "cuda" : "cpu"}`), version: inventory.version };
   } finally {
     if (running && existsSync(binary)) await invoke(binary, ["--server", "off", "--home", env.ZVEC_GREP_HOME]).catch(() => {});
     server.closeAllConnections();

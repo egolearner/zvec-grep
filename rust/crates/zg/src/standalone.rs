@@ -16,11 +16,12 @@ use sha2::{Digest, Sha256};
 use zg_cli::StandaloneArgs;
 use zg_daemon::{InstallationDaemon, ServerConfig};
 
-mod launcher;
-use launcher::Launcher;
+mod entry;
+mod selection;
+mod versioned;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
-const OWNER: &str = "zvec-grep standalone v1\n";
+const OWNER: &str = "zvec-grep standalone v2\n";
 const MANIFEST: &str = "install-manifest.json";
 const RECEIPT: &str = "install-receipt.json";
 
@@ -40,7 +41,7 @@ struct Manifest {
     files: BTreeMap<String, PayloadFile>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Receipt {
     schema_version: u32,
@@ -55,6 +56,10 @@ struct Receipt {
     path_managed: bool,
     #[serde(default)]
     launcher: Option<PathBuf>,
+    #[serde(default)]
+    bundle: Option<String>,
+    #[serde(default)]
+    launcher_sha256: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -89,7 +94,7 @@ impl Restart {
         config.token_file = token_file
             .map(Path::to_owned)
             .or_else(|| self.token_file.clone());
-        // Legacy journals do not establish that anonymous restart was safe.
+        // Missing authentication metadata does not establish that anonymous restart is safe.
         if self.authentication_required.unwrap_or(true)
             && zg_daemon::resolve_token(config.token_file.as_deref())?.is_none()
         {
@@ -97,16 +102,6 @@ impl Restart {
         }
         Ok(config)
     }
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Pending {
-    had_previous: bool,
-    home: PathBuf,
-    restart: Option<Restart>,
-    #[serde(default)]
-    launcher: Option<Launcher>,
 }
 
 fn binary(root: &Path) -> PathBuf {
@@ -141,14 +136,6 @@ fn read_json<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<T> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
-fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    serde_json::to_writer_pretty(&mut file, value)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    Ok(())
-}
-
 fn regular_path(root: &Path, relative: &str) -> Result<PathBuf> {
     if relative.is_empty()
         || relative.contains('\\')
@@ -175,7 +162,8 @@ fn regular_path(root: &Path, relative: &str) -> Result<PathBuf> {
 fn verify_bundle(root: &Path) -> Result<Manifest> {
     let manifest: Manifest = read_json(&regular_path(root, MANIFEST)?)?;
     if manifest.schema_version != 1
-        || manifest.version != env!("CARGO_PKG_VERSION")
+        || (cfg!(windows) && !manifest.files.contains_key("bin/zg-launcher.exe"))
+        || !versioned::valid_version(&manifest.version)
         || manifest.target != target()
         || !["cpu", "cuda"].contains(&manifest.accelerator.as_str())
         || !manifest.files.contains_key(if cfg!(windows) {
@@ -322,65 +310,6 @@ async fn check_binary_with_timeout(path: &Path, version: &str, timeout: Duration
     Ok(())
 }
 
-async fn rollback(
-    root: &Path,
-    pending: &Pending,
-    daemon: &InstallationDaemon,
-    token_file: Option<&Path>,
-) -> Result<()> {
-    let restart = pending
-        .restart
-        .as_ref()
-        .map(|restart| restart.config(token_file))
-        .transpose()?;
-    if restart.is_some() {
-        daemon.require_owned()?;
-    }
-    daemon.stop().await?;
-    let current = root.join("current");
-    let previous = root.join("previous");
-    if previous.exists() {
-        remove_directory(&current)?;
-        fs::rename(previous, &current)?;
-    } else if !pending.had_previous {
-        remove_directory(&current)?;
-    }
-    if let Some(launcher) = &pending.launcher {
-        launcher.restore()?;
-    }
-    daemon.restart(&binary(&current), restart.as_ref()).await?;
-    fs::remove_file(root.join("pending.json"))?;
-    Ok(())
-}
-
-async fn recover(root: &Path, token_file: Option<&Path>) -> Result<Option<PathBuf>> {
-    if !root.join("pending.json").exists() {
-        return Ok(None);
-    }
-    let pending: Pending = read_json(&root.join("pending.json"))?;
-    let token_file = token_file.or_else(|| {
-        pending
-            .restart
-            .as_ref()
-            .and_then(|restart| restart.token_file.as_deref())
-    });
-    if let Some(restart) = &pending.restart {
-        restart.config(token_file)?;
-    }
-    let daemon = InstallationDaemon::acquire(
-        &pending.home,
-        &[
-            binary(&root.join("current")),
-            binary(&root.join("previous")),
-        ],
-        token_file,
-    )
-    .await?;
-    rollback(root, &pending, &daemon, token_file).await?;
-    eprintln!("Recovered the previous installation after an interrupted update.");
-    Ok(token_file.map(Path::to_owned))
-}
-
 fn release_source(repository: &str) -> Result<String> {
     let parts: Vec<_> = repository.split('/').collect();
     if parts.len() != 2
@@ -403,7 +332,6 @@ async fn prepare_candidate(
     executable: &Path,
     next: &Path,
     home: &Path,
-    launcher: Option<&Launcher>,
 ) -> Result<Option<Receipt>> {
     remove_directory(next)?;
     if args.remove {
@@ -414,6 +342,9 @@ async fn prepare_candidate(
         .and_then(Path::parent)
         .ok_or_else(|| io::Error::other("invalid staging layout"))?;
     let manifest = verify_bundle(source_root)?;
+    if manifest.version != env!("CARGO_PKG_VERSION") {
+        return Err(io::Error::other("staging executable and bundle version differ").into());
+    }
     if (args.accelerator == "cpu" && manifest.accelerator != "cpu")
         || (args.accelerator == "cuda" && manifest.accelerator != "cuda")
     {
@@ -423,7 +354,7 @@ async fn prepare_candidate(
     copy_bundle(source_root, next, &manifest)?;
     verify_bundle(next)?;
     let receipt = Receipt {
-        schema_version: 1,
+        schema_version: 2,
         source: release_source(&args.repository)?,
         version: manifest.version,
         target: manifest.target,
@@ -432,19 +363,10 @@ async fn prepare_candidate(
         home: home.to_owned(),
         modify_path: !args.no_modify_path,
         path_managed: args.path_managed,
-        launcher: launcher.map(|launcher| launcher.path.clone()),
+        launcher: None,
+        bundle: None,
+        launcher_sha256: None,
     };
-    write_json(&next.join(RECEIPT), &receipt)?;
-    fs::write(
-        next.join("install-state.tsv"),
-        format!(
-            "accelerator\t{}\nmodify_path\t{}\npath_managed\t{}\nrepository\t{}\n",
-            receipt.accelerator_requested,
-            u8::from(receipt.modify_path),
-            u8::from(receipt.path_managed),
-            args.repository
-        ),
-    )?;
     check_binary(&binary(next), &receipt.version).await?;
     candidate.0 = None;
     Ok(Some(receipt))
@@ -463,9 +385,9 @@ impl Drop for CandidateCleanup<'_> {
 }
 
 fn check_data_layout(root: &Path, home: &Path) -> Result<()> {
-    // The managed bin subtree may share the data home; no other data subtree may
+    // The managed distribution subtree may share the data home; no other data subtree may
     // become an installation root or be included in a program replacement.
-    if home.starts_with(root) || (root.starts_with(home) && root != home.join("bin")) {
+    if home.starts_with(root) || (root.starts_with(home) && root != home.join("dist")) {
         return Err(
             io::Error::other("installation and daemon data directories must be separate").into(),
         );
@@ -489,7 +411,7 @@ fn installation_home(args: &StandaloneArgs, root: &Path, old: Option<&Receipt>) 
     let home = home.canonicalize()?;
     check_data_layout(root, &home)?;
     if let Some(receipt) = old
-        && (receipt.schema_version != 1
+        && (receipt.schema_version != 2
             || receipt.target != target()
             || receipt.home.canonicalize()? != home)
     {
@@ -498,124 +420,12 @@ fn installation_home(args: &StandaloneArgs, root: &Path, old: Option<&Receipt>) 
     Ok(home)
 }
 
-async fn installation_daemon(
-    root: &Path,
-    home: &Path,
-    token_file: Option<&Path>,
-) -> Result<InstallationDaemon> {
-    let daemon =
-        InstallationDaemon::acquire(home, &[binary(&root.join("current"))], token_file).await?;
-    if daemon
-        .external_executable()
-        .is_some_and(|executable| executable.starts_with(root))
-    {
-        // A misplaced process inside the managed tree cannot survive replacing that tree.
-        daemon.require_owned()?;
-    }
-    Ok(daemon)
+pub fn installed_launcher() -> Result<Option<PathBuf>> {
+    versioned::installed_launcher()
 }
 
 pub async fn execute(args: &StandaloneArgs) -> Result<()> {
-    let root = std::path::absolute(&args.install_dir)?;
-    let _lock = installation_lock(&root)?;
-    let root = root.canonicalize()?;
-    let recovered_token_file = recover(&root, args.token_file.as_deref()).await?;
-    let token_file = args
-        .token_file
-        .as_deref()
-        .or(recovered_token_file.as_deref());
-    let current = root.join("current");
-    let previous = root.join("previous");
-    let next = root.join("next");
-    let old: Option<Receipt> = if current.exists() {
-        Some(read_json(&regular_path(
-            &root,
-            &format!("current/{RECEIPT}"),
-        )?)?)
-    } else {
-        None
-    };
-    let home = installation_home(args, &root, old.as_ref())?;
-    let launcher = args
-        .launcher
-        .as_ref()
-        .or_else(|| old.as_ref().and_then(|old| old.launcher.as_ref()))
-        .map(|path| Launcher::prepare(path, &root, args.remove))
-        .transpose()?;
-    if let Some(previous_launcher) = old.as_ref().and_then(|old| old.launcher.as_ref())
-        && launcher
-            .as_ref()
-            .is_some_and(|launcher| &launcher.path != previous_launcher)
-    {
-        return Err(io::Error::other("preserve the existing command link when upgrading").into());
-    }
-    if args.remove && old.is_none() {
-        return Err(io::Error::other("no standalone installation to remove").into());
-    }
-    let executable = std::env::current_exe()?.canonicalize()?;
-    if executable.starts_with(&current)
-        || executable.starts_with(&previous)
-        || executable.starts_with(&next)
-    {
-        return Err(io::Error::other(
-            "run install.sh or install.ps1; activation must run from a separate staging bundle",
-        )
-        .into());
-    }
-    let receipt = prepare_candidate(args, &executable, &next, &home, launcher.as_ref()).await?;
-    let _candidate_cleanup = CandidateCleanup(Some(&next));
-    let daemon = installation_daemon(&root, &home, token_file).await?;
-    // The prior rollback copy is removed before the journal is created, so its
-    // presence unambiguously means that the current transaction moved the old bundle.
-    remove_directory(&previous)?;
-    let pending = Pending {
-        had_previous: old.is_some(),
-        home,
-        restart: daemon
-            .config()
-            .map(|config| Restart::from_config(config, daemon.authentication_required())),
-        launcher,
-    };
-    let journal = root.join(".pending-new.json");
-    if journal.exists() {
-        fs::remove_file(&journal)?;
-    }
-    write_json(&journal, &pending)?;
-    fs::rename(journal, root.join("pending.json"))?;
-    let result: Result<()> = async {
-        daemon.stop().await?;
-        if old.is_some() {
-            fs::rename(&current, &previous)?;
-        }
-        if let Some(receipt) = &receipt {
-            fs::rename(&next, &current)?;
-            check_binary(&binary(&current), &receipt.version).await?;
-            if let Some(launcher) = &pending.launcher {
-                launcher.install()?;
-                check_binary(&launcher.path, &receipt.version).await?;
-            }
-            daemon.restart(&binary(&current), daemon.config()).await?;
-        } else if let Some(launcher) = &pending.launcher {
-            launcher.remove()?;
-        }
-        Ok(())
-    }
-    .await;
-    if let Err(error) = result {
-        if let Err(recovery) = rollback(&root, &pending, &daemon, token_file).await {
-            return Err(io::Error::other(format!("installation failed: {error}; recovery failed: {recovery}; rerun the installer to recover")).into());
-        }
-        return Err(error);
-    }
-    fs::remove_file(root.join("pending.json"))?;
-    let external_executable = daemon.external_executable().map(Path::to_owned);
-    drop(daemon);
-    complete_installation(
-        args,
-        receipt.as_ref(),
-        &root,
-        external_executable.as_deref(),
-    )
+    versioned::execute(args).await
 }
 
 fn shell_command(executable: &Path, arguments: &[&str]) -> String {
@@ -679,10 +489,9 @@ fn print_manual_switch(args: &StandaloneArgs, receipt: &Receipt, launcher: &Path
 fn complete_installation(
     args: &StandaloneArgs,
     receipt: Option<&Receipt>,
-    root: &Path,
+    current: &Path,
     external: Option<&Path>,
-) -> Result<()> {
-    let current = root.join("current");
+) {
     if let Some(external) = external {
         println!("External daemon left running: {}", external.display());
         println!(
@@ -695,14 +504,14 @@ fn complete_installation(
             receipt.version,
             receipt.target,
             receipt.accelerator_actual,
-            binary(&current).display()
+            binary(current).display()
         );
         if receipt.accelerator_actual == "cuda" {
             println!(
                 "CUDA plugins installed. Compatible NVIDIA drivers and CUDA/cuBLAS/cuDNN host libraries are still required."
             );
         }
-        let launcher = receipt.launcher.clone().unwrap_or_else(|| binary(&current));
+        let launcher = receipt.launcher.clone().unwrap_or_else(|| binary(current));
         if !args.skip_agent_upgrade {
             let mut command = Command::new(&launcher);
             command
@@ -730,10 +539,8 @@ fn complete_installation(
         }
         println!("Re-run the installer to upgrade or select an older version.");
     } else {
-        remove_directory(&root.join("previous"))?;
         println!("Removed standalone binaries. Configuration, models and indexes were preserved.");
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -761,7 +568,6 @@ mod tests {
         fs::create_dir_all(source.join("bin")).expect("bin");
         let executable = binary(&source);
         fs::write(&executable, "fixture").expect("binary");
-        fs::write(source.join(RECEIPT), "{}").expect("conflicting receipt");
         let digest = |bytes: &[u8]| {
             let mut digest = String::new();
             for byte in Sha256::digest(bytes) {
@@ -774,9 +580,15 @@ mod tests {
         } else {
             "bin/zg"
         };
+        let mut files = serde_json::json!({ (name): { "bytes": 7, "sha256": digest(b"fixture") } });
+        if cfg!(windows) {
+            fs::write(source.join("bin/zg-launcher.exe"), "fixture").expect("launcher");
+            files["bin/zg-launcher.exe"] =
+                serde_json::json!({ "bytes": 7, "sha256": digest(b"fixture") });
+        }
         fs::write(source.join(MANIFEST), serde_json::to_vec(&serde_json::json!({
             "schemaVersion": 1, "version": env!("CARGO_PKG_VERSION"), "target": target(), "accelerator": "cpu",
-            "files": { (name): { "bytes": 7, "sha256": digest(b"fixture") }, (RECEIPT): { "bytes": 2, "sha256": digest(b"{}") } }
+            "files": files
         })).expect("manifest")).expect("manifest");
         let root = temp.path().join("program");
         fs::create_dir(&root).expect("root");
@@ -784,6 +596,7 @@ mod tests {
         let args = StandaloneArgs {
             install_dir: root,
             launcher: None,
+            activate: None,
             accelerator: "cpu".into(),
             home: None,
             token_file: None,
@@ -793,14 +606,10 @@ mod tests {
             repository: "zvec-ai/zvec-grep".into(),
             remove: false,
         };
-        let error = prepare_candidate(&args, &executable, &next, temp.path(), None)
+        let _error = prepare_candidate(&args, &executable, &next, temp.path())
             .await
             .err()
-            .expect("receipt collision");
-        assert_eq!(
-            error.downcast_ref::<io::Error>().expect("I/O error").kind(),
-            io::ErrorKind::AlreadyExists
-        );
+            .expect("invalid executable");
         assert!(!next.exists());
     }
 
@@ -822,11 +631,11 @@ mod tests {
     }
 
     #[test]
-    fn only_the_managed_bin_subtree_may_share_the_data_home() {
+    fn only_the_managed_dist_subtree_may_share_the_data_home() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let home = temporary.path().join("data");
         let separate = temporary.path().join("program");
-        assert!(check_data_layout(&home.join("bin"), &home).is_ok());
+        assert!(check_data_layout(&home.join("dist"), &home).is_ok());
         assert!(check_data_layout(&separate, &home).is_ok());
         for root in [&home, &home.join("models"), &home.join("daemon")] {
             assert!(check_data_layout(root, &home).is_err());

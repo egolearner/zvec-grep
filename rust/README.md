@@ -765,8 +765,8 @@ support matrix, runtime dependencies, and publication policy.
 
 The [GitHub Releases installers](standalone/README.md) install complete native
 bundles without Node/npm. Re-run the installer to upgrade, or select a tagged
-version. On Unix, programs live in `~/.zvec-grep/bin` and `~/.local/bin/zg` links
-to the stable executable; PATH setup is printed for the user to apply. The installers
+version. On Unix, versioned programs live in `~/.zvec-grep/dist` and `~/.local/bin/zg` links
+through the `current` package symlink; PATH setup is printed for the user to apply. The installers
 preserve user data and coordinate
 upgrades with the local daemon. CUDA still requires compatible host runtime
 libraries. The installer endpoints become available after the first standalone

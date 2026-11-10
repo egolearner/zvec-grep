@@ -67,6 +67,10 @@ export async function collectStandaloneRelease({ manifest = loadReleaseManifest(
         await mkdir(payload, { recursive: true });
         materialize({ metaRoot: payload, platformRoot: join(source, "package"), entry, expectedVersion: release.version,
           config: { mode: accelerator, directory: tarballRoot, offline: true } });
+        if (entry.os === "win32") {
+          // The verified npm runtime carries the standalone launcher without adding another npm command.
+          await rename(join(payload, "lib", "zg-launcher.exe"), join(payload, "bin", "zg-launcher.exe"));
+        }
         // npm uses zg.exe on every OS; standalone preserves the platform's native name.
         if (entry.binary !== "zg.exe") await rename(join(payload, "bin", "zg.exe"), join(payload, "bin", entry.binary));
         if (entry.os !== "win32") await chmod(join(payload, "bin", entry.binary), 0o755);

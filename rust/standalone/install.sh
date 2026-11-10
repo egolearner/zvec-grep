@@ -20,14 +20,15 @@ usage() {
 Usage: install.sh [--version VERSION] [--accelerator auto|cpu|cuda]
                   [--install-dir PATH] [--home PATH]
                   [--token-file PATH]
-                  [--skip-agent-upgrade] [--uninstall]
+                  [--skip-agent-upgrade] [--activate VERSION | --uninstall]
 Re-run to upgrade. CUDA plugins require compatible host drivers and runtime libraries.
-Programs: ~/.zvec-grep/bin; command link: ~/.local/bin/zg. Shell configuration is never modified.
+Programs: ~/.zvec-grep/dist; command link: ~/.local/bin/zg. Shell configuration is never modified.
 EOF
 }
 
-install_dir=${ZG_INSTALL_DIR:-"$HOME/.zvec-grep/bin"}
+install_dir=${ZG_INSTALL_DIR:-"$HOME/.zvec-grep/dist"}
 version=
+activate=
 repository=${ZG_INSTALL_REPOSITORY:-}
 accelerator=${ZG_INSTALL_ACCELERATOR:-}
 skip_agents=${ZG_INSTALL_SKIP_AGENT_UPGRADE:-0}
@@ -41,10 +42,11 @@ while [ "$#" -gt 0 ]; do
         --no-modify-path) shift ;;
         --skip-agent-upgrade) skip_agents=1; shift ;;
         --uninstall) remove=1; shift ;;
-        --version|--accelerator|--install-dir|--home|--token-file)
+        --version|--activate|--accelerator|--install-dir|--home|--token-file)
             [ "$#" -ge 2 ] && [ -n "$2" ] || fail "$1 requires a value"
             case "$1" in
                 --version) version=$2 ;;
+                --activate) activate=$2 ;;
                 --accelerator) accelerator=$2 ;;
                 --install-dir) install_dir=$2 ;;
                 --home) daemon_home=$2 ;;
@@ -55,8 +57,8 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 case "$install_dir" in /*) ;; *) install_dir="$PWD/$install_dir" ;; esac
-state="$install_dir/current/install-state.tsv"
-if [ -f "$install_dir/pending.json" ] && [ -f "$install_dir/previous/install-state.tsv" ]; then state="$install_dir/previous/install-state.tsv"; fi
+[ -z "$activate" ] || { [ -z "$version" ] && [ "$remove" = 0 ]; } || fail "--activate cannot be combined with --version or --uninstall"
+state="$install_dir/install-state.tsv"
 read_state() { if [ -f "$state" ]; then awk -F '\t' -v key="$1" '$1 == key {print $2; exit}' "$state"; fi; }
 [ -n "$accelerator" ] || accelerator=$(read_state accelerator)
 [ -n "$repository" ] || repository=$(read_state repository)
@@ -125,12 +127,23 @@ has_nvidia() {
     [ "$result" = 0 ] && [ -s "$staging/nvidia" ]
 }
 
-if [ "$remove" = 1 ]; then
-    source_dir="$install_dir/current"
-    if [ -f "$install_dir/pending.json" ] && [ -f "$install_dir/previous/install-receipt.json" ]; then source_dir="$install_dir/previous"; fi
-    [ -f "$source_dir/install-receipt.json" ] || fail "no standalone installation at $install_dir"
-    cp -R "$source_dir" "$staging/zg"
-else
+cached=0
+if [ "$remove" = 1 ] || [ -n "$activate" ]; then
+    bundle=$(read_state bundle)
+    printf '%s\n' "$bundle" | LC_ALL=C grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?/[A-Za-z0-9-]+-(cpu|cuda)$' || fail "no valid standalone installation at $install_dir"
+    source_dir="$install_dir/$bundle"
+    if [ -f "$source_dir/bin/zg" ]; then
+        cp -R "$source_dir" "$staging/zg"
+        if check_version "$staging/zg/bin/zg" "$(read_state version)"; then cached=1; fi
+    fi
+    if [ "$cached" = 0 ]; then
+        [ -z "$activate" ] || fail "cached executable is unavailable; repair the installation first"
+        # A committed uninstall may already have deleted part of the cached runtime.
+        rm -rf "$staging/zg"
+        version=$(read_state version)
+    fi
+fi
+if [ "$cached" = 0 ]; then
     command -v tar >/dev/null 2>&1 || fail "tar is required"
     if [ -n "$version" ]; then manifest_url="$base_url/download/rust-v$version/manifest.tsv"
     else manifest_url="$base_url/latest/download/manifest.tsv"; fi
@@ -178,6 +191,7 @@ fi
 
 set -- --standalone --install-dir "$install_dir" --accelerator "$accelerator" --repository "$repository" --no-modify-path --launcher "$HOME/.local/bin/zg"
 [ "$remove" = 0 ] || set -- "$@" --remove
+[ -z "$activate" ] || set -- "$@" --activate "$activate"
 [ "$skip_agents" = 0 ] || set -- "$@" --skip-agent-upgrade
 [ -z "$daemon_home" ] || set -- "$@" --home "$daemon_home"
 [ -z "$token_file" ] || set -- "$@" --token-file "$token_file"

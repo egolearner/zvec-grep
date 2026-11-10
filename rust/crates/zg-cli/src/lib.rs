@@ -232,6 +232,8 @@ pub struct StandaloneArgs {
     pub install_dir: PathBuf,
     #[arg(long)]
     pub launcher: Option<PathBuf>,
+    #[arg(long, conflicts_with = "remove")]
+    pub activate: Option<String>,
     #[arg(long, value_parser = ["auto", "cpu", "cuda"], default_value = "auto")]
     pub accelerator: String,
     #[arg(long)]

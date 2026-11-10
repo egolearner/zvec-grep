@@ -42,6 +42,7 @@ async function fixture(t, target = "linux-x64-gnu") {
   }
   const binary = `bin/${entry.binary}`;
   const contents = { [binary]: "fixture binary", "lib/core": "same core", "lib/licenses/upstream.txt": "upstream notice" };
+  if (entry.os === "win32") contents["lib/zg-launcher.exe"] = "native launcher";
   const files = Object.fromEntries(Object.entries(contents).map(([name, data]) => [name, checksum(data)]));
   const checksums = { schemaVersion: entry.components?.length ? 3 : 1, target, files };
   if (entry.components?.length) {
@@ -103,6 +104,7 @@ test("Windows standalone output is a ZIP with native executable layout", async (
   const listing = process.platform === "win32" ? run("tar", ["-tf", archive], { capture: true }) : run("unzip", ["-Z1", archive], { capture: true });
   assert.match(listing, /zg\/bin\/zg.exe/);
   assert.match(listing, /zg\/install-manifest.json/);
+  assert.match(listing, /zg\/bin\/zg-launcher.exe/);
 });
 
 test("tampered or incomplete collected artifacts cannot become standalone releases", async (t) => {

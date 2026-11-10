@@ -10,7 +10,9 @@ use std::{
 };
 
 #[cfg(target_os = "macos")]
-use std::{ffi::OsString, os::unix::process::CommandExt, process::Command};
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::{os::unix::process::CommandExt, process::Command};
 
 use tokio::runtime::Builder;
 use tracing::debug;
@@ -117,6 +119,18 @@ fn parse_cli() -> (Cli, Option<String>) {
 mod standalone;
 
 fn run() -> Result<ExitCode, Box<dyn Error>> {
+    #[cfg(unix)]
+    {
+        // Pin executable-relative resources before a later update changes a command symlink.
+        let executable = std::env::current_exe()?;
+        let resolved = executable.canonicalize()?;
+        if executable != resolved {
+            return Err(Command::new(resolved)
+                .args(std::env::args_os().skip(1))
+                .exec()
+                .into());
+        }
+    }
     let (cli, warning) = parse_cli();
     let _ = OUTPUT_OPTIONS.set(cli.output_options());
     let warn = || {
@@ -130,9 +144,14 @@ fn run() -> Result<ExitCode, Box<dyn Error>> {
         }
     };
     let positional_warning = cli.positional_query_warning();
-    let plan = cli
+    let mut plan = cli
         .into_plan(std::env::current_dir()?)
         .inspect_err(|_| warn())?;
+    if let CliPlan::Install(args) = &mut plan
+        && args.launcher.is_none()
+    {
+        args.launcher = standalone::installed_launcher()?;
+    }
     match &plan {
         CliPlan::Help(topic) => {
             warn();

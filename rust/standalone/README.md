@@ -39,6 +39,7 @@ Shell options and their PowerShell equivalents:
 
 | Shell | PowerShell | Meaning |
 | --- | --- | --- |
+| `--activate VERSION` | `-ActivateVersion VERSION` | Select an already retained version without downloads; combine with an accelerator to select its variant |
 | `--version VERSION` | `-Version VERSION` | Select a published version; omit for Latest |
 | `--accelerator auto\|cpu\|cuda` | `-Accelerator auto\|cpu\|cuda` | Select optional NVIDIA components |
 | `--install-dir PATH` | `-InstallDir PATH` | Choose an installation directory |
@@ -75,11 +76,11 @@ Unix needs a POSIX shell, curl or wget, tar with gzip support, standard text uti
 sha256sum or shasum. Windows uses PowerShell and .NET ZIP/hash support. No compiler,
 Python, jq or package manager runs during installation.
 
-On Unix, the complete program and upgrade state live under `~/.zvec-grep/bin`.
+On Unix, the complete program and upgrade state live under `~/.zvec-grep/dist`.
 The installer creates this absolute symlink to the stable executable:
 
 ```text
-~/.local/bin/zg -> ~/.zvec-grep/bin/current/bin/zg
+~/.local/bin/zg -> ~/.zvec-grep/dist/current/bin/zg
 ```
 
 The shell installer never changes PATH or shell configuration files. If
@@ -104,7 +105,10 @@ A custom `--install-dir` changes the link target while the command entry remains
 resolve it before retrying. The receipt records the owned launcher, so updates
 reuse it and uninstall only removes it if it still points to this installation.
 
-Windows keeps its native executable entry and updates User PATH unless
+Windows keeps a small native launcher at `<InstallDir>\bin\zg.exe`. It reads the
+`current` text pointer, resolves the selected executable, and forwards arguments,
+standard streams and exit status. This does not require symlink privileges. The
+installer updates User PATH unless
 `-NoModifyPath` is selected. Open a new terminal afterwards. Its installer does
 not create Unix-style command symlinks. npm-owned files are never overwritten.
 Uninstall respects the saved PATH opt-out and an explicit `-NoModifyPath`.
@@ -137,21 +141,53 @@ runtime diagnostics and `--device` controls to verify actual inference.
 
 ## Installation state and recovery
 
-Default roots are `~/.zvec-grep/bin` on Unix and
+Default roots are `~/.zvec-grep/dist` on Unix and
 `%LOCALAPPDATA%\zvec-grep\standalone` on Windows. Each root contains:
 
 ```text
-.zg-standalone          # Ownership marker
-.install.lock          # OS-held installation lock; no stale PID lock recovery
-current/bin/zg[.exe]    # Stable executable; the Unix command symlink targets it
-current/lib/           # Complete runtime libraries
-current/install-manifest.json
-current/install-receipt.json
-current/install-state.tsv
-previous/              # Last installation, retained until the next transaction
-next/                  # Fully verified candidate before activation
-pending.json           # Recovery journal, including command-link state
+.zg-standalone                  # Ownership marker
+.install.lock                   # OS-held installation lock
+0.3.1/darwin-arm64-cpu/bin/zg    # Immutable complete package
+0.3.1/darwin-arm64-cpu/lib/
+0.3.1/darwin-arm64-cpu/install-manifest.json
+0.3.0/darwin-arm64-cpu/          # Retained version
+current -> 0.3.1/darwin-arm64-cpu
+install-receipt.json            # Active version, source, home and command ownership
+install-state.tsv               # Bootstrap preferences and recovery executable location
+.staging/                       # Candidate being verified
+activation.json                 # Interrupted activation or uninstall transaction
 ```
+
+Only `current` selects the active package. Unix replaces a temporary symlink using
+same-directory rename; version directories and the command symlink stay in place.
+Windows atomically replaces a text pointer named `current` and retains its native
+launcher. The atomic replacement removes the unlink/create gap; it does not promise
+that every concurrent OS path lookup succeeds. A rapid replacement stress test on
+macOS/APFS also reproduced transient `EINVAL` with plain Python `os.replace`, while
+the directory entry remained present. Unchanged selections are not rewritten. Executables resolve their actual version path at startup, so lazy loading
+of plugins and other resources cannot cross versions during an upgrade.
+
+All successfully staged versions are retained; there is no automatic pruning or
+selection of the highest version. CPU and CUDA packages have separate directories.
+Reinstalling the same version/target/variant reuses an identical verified package
+and rejects a different payload at that immutable path. Uninstall removes all owned
+version packages while preserving daemon data, configuration, models and indexes.
+
+For an offline rollback, keep a local copy of the script and select an installed
+full version explicitly:
+
+```sh
+sh install.sh --activate 0.3.0 --accelerator cpu
+```
+
+```powershell
+.\install.ps1 -ActivateVersion 0.3.0 -Accelerator cpu
+```
+
+Activation uses no downloads or GPU probing. An `auto` accelerator preserves the
+currently selected variant. The requested package must already exist and pass
+manifest, checksum and executable-version checks. The daemon transaction and
+agent migration rules are the same as for an online upgrade.
 
 The binary invoked from staging performs the transaction on both OS families.
 It copies and verifies the new bundle before taking the local daemon startup
@@ -166,20 +202,25 @@ its existing token before it can be restarted.
 Recovery records whether authentication is required, without storing token values.
 After an interruption, supply the original token environment or `--token-file`;
 missing credentials cannot restart a protected service anonymously. Saved token-file
-paths are reused. Older recovery journals without authentication metadata require
-credentials rather than assuming that anonymous startup is safe.
+paths are reused. Missing authentication metadata requires credentials rather than
+assuming that anonymous startup is safe.
 
-The old directory is retained while the candidate becomes `current`. An active
-daemon restarts with its previous listen address and toolset. Failed activation
-restores the old directory and service; an interrupted transaction is recovered
-when the installer next runs. Stop direct CLI processes before updating on
-Windows: locked EXE/DLL files can prevent directory replacement. The installer
-reports the failure and preserves recovery state if it cannot restore immediately.
-Recovery that needs to restart an owned daemon still refuses to take over an
-external daemon that appeared after the interruption; stop that daemon explicitly
-before retrying. Uninstall leaves external daemons running.
+An active owned daemon restarts from the selected package with its previous listen
+address, toolset and authentication settings. Failed activation restores the old
+selection and service; an interrupted transaction is recovered when the installer
+next runs. Recovery that needs to restart an owned daemon refuses to take over an
+external daemon that appeared after the interruption; stop it explicitly before
+retrying. Uninstall leaves external daemons running.
 
-Existing supported integration launchers can be migrated to the stable absolute
+Uninstall records its committed state before deleting packages. Interrupted cleanup
+resumes deletion instead of restoring a partially removed package. On Windows,
+close direct CLI processes and MCP clients before uninstalling: locked EXE/DLL files
+can delay deletion. Re-run the uninstall script to resume; if its cached recovery
+executable has already been removed, the script downloads the same recorded release.
+Ordinary upgrades do not replace or remove files used by older direct processes.
+
+New integrations created through an installed standalone executable use its fixed
+command entry, including after a rollback. Existing supported integration launchers can be migrated to the stable absolute
 entry using `zg --install --upgrade-installed --launcher <ABSOLUTE_EXECUTABLE>`.
 The existing configuration backup and comment-preservation behavior is retained.
 With an external daemon, the installer only previews this migration (`--dry-run`):
