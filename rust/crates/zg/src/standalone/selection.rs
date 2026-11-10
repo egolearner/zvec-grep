@@ -108,7 +108,7 @@ mod tests {
             let reader = scope.spawn(move || {
                 while running_reader.load(Ordering::Relaxed) {
                     // Check rename's directory-entry guarantee without resolving the target.
-                    // macOS can return transient EINVAL from concurrent path resolution.
+                    // The stress assertion concerns entry presence, not every concurrent path lookup.
                     let metadata = fs::symlink_metadata(root.join("current"))
                         .expect("selection entry remains present");
                     assert!(if cfg!(unix) {

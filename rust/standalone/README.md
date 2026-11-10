@@ -161,10 +161,8 @@ activation.json                 # Interrupted activation or uninstall transactio
 Only `current` selects the active package. Unix replaces a temporary symlink using
 same-directory rename; version directories and the command symlink stay in place.
 Windows atomically replaces a text pointer named `current` and retains its native
-launcher. The atomic replacement removes the unlink/create gap; it does not promise
-that every concurrent OS path lookup succeeds. A rapid replacement stress test on
-macOS/APFS also reproduced transient `EINVAL` with plain Python `os.replace`, while
-the directory entry remained present. Unchanged selections are not rewritten. Executables resolve their actual version path at startup, so lazy loading
+launcher. The installer serializes changes with its installation lock and skips
+replacing an unchanged selection. Executables resolve their actual version path at startup, so lazy loading
 of plugins and other resources cannot cross versions during an upgrade.
 
 All successfully staged versions are retained; there is no automatic pruning or

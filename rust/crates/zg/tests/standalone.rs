@@ -938,3 +938,174 @@ fn agent_migration_failure_does_not_roll_back_a_successful_installation() {
     );
     assert!(fixture.agent_backups().is_empty());
 }
+
+async fn mcp_ping(command: Command) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::{io, process::Stdio, time::Duration};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut child = tokio::process::Command::from(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("the fixed command entry must launch");
+    let mut input = child.stdin.take().expect("MCP input");
+    let mut lines = BufReader::new(child.stdout.take().expect("MCP output")).lines();
+    let exchange = async {
+        for request in [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"installer-regression","version":"1"}}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"ping"}),
+        ] {
+            input.write_all(format!("{request}\n").as_bytes()).await?;
+            loop {
+                let line = lines.next_line().await?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "MCP disconnected during daemon replacement",
+                    )
+                })?;
+                let response: Value = serde_json::from_str(&line)?;
+                if response["id"] == request["id"] {
+                    if response.get("result").is_none() {
+                        return Err(io::Error::other(format!("MCP response: {response}")).into());
+                    }
+                    break;
+                }
+            }
+            if request["id"] == 1 {
+                input
+                    .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+                    .await?;
+            }
+        }
+        drop(input);
+        if !child.wait().await?.success() {
+            return Err(io::Error::other("MCP client exited unsuccessfully").into());
+        }
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    tokio::time::timeout(Duration::from_secs(30), exchange).await?
+}
+
+async fn repeated_version_probe(command: Command) {
+    use std::time::Duration;
+    let mut command = tokio::process::Command::from(command);
+    command.kill_on_drop(true);
+    for _ in 0..6 {
+        let output = tokio::time::timeout(Duration::from_secs(15), command.output())
+            .await
+            .expect("CLI deadline")
+            .expect("fixed entry must launch");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            env!("CARGO_PKG_VERSION")
+        );
+        success(output);
+    }
+}
+
+#[tokio::test]
+async fn one_upgrade_serializes_installers_and_allows_concurrent_cli_and_mcp_clients() {
+    use std::{process::Stdio, time::Duration};
+    let fixture = Fixture::new();
+    success(fixture.install());
+    let listener = TcpListener::bind("127.0.0.1:0").expect("port");
+    let address = listener.local_addr().expect("address").to_string();
+    drop(listener);
+    success(
+        fixture
+            .command(&fixture.launcher())
+            .args(["--server", "on", "--listen", &address, "--home"])
+            .arg(&fixture.home)
+            .output()
+            .expect("start owned daemon"),
+    );
+    let instance = fixture.instance_token();
+    let original = fixture.installed();
+    // Hold the daemon claim so the first installer demonstrably owns the install lock
+    // before another installer and ordinary clients are launched.
+    let claim = zg_daemon::InstallationDaemon::acquire(
+        &fixture.home,
+        std::slice::from_ref(&original),
+        None,
+    )
+    .await
+    .expect("hold daemon claim");
+    fixture.write_variant("concurrent upgrade", "cuda");
+    let mut upgrade = tokio::process::Command::from(fixture.install_command())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("upgrade");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !fixture.version_dir("cuda").exists() {
+            assert!(
+                upgrade.try_wait().expect("upgrade status").is_none(),
+                "installer stopped before staging"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("candidate prepared before daemon claim");
+    let competing = tokio::process::Command::from(fixture.install_command())
+        .output()
+        .await
+        .expect("competing installer");
+    assert!(!competing.status.success());
+    assert!(
+        String::from_utf8_lossy(&competing.stderr)
+            .contains("another standalone installation is running")
+    );
+    let mut clients = Vec::new();
+    for _ in 0..4 {
+        let mut command = fixture.command(&fixture.launcher());
+        command.arg("--version");
+        clients.push(tokio::spawn(repeated_version_probe(command)));
+    }
+    let mcp_command = || {
+        let mut command = fixture.command(&fixture.launcher());
+        command
+            .args(["--server", "--stdio", "--home"])
+            .arg(&fixture.home)
+            .args(["--listen", &address]);
+        command
+    };
+    let bridges: Vec<_> = (0..2)
+        .map(|_| tokio::spawn(mcp_ping(mcp_command())))
+        .collect();
+    drop(claim);
+    success(
+        tokio::time::timeout(Duration::from_secs(40), upgrade.wait_with_output())
+            .await
+            .expect("upgrade deadline")
+            .expect("upgrade output"),
+    );
+    for client in clients {
+        client.await.expect("CLI worker");
+    }
+    for bridge in bridges {
+        // A connection attached to the old daemon may close; reconnect through the same entry.
+        if let Err(error) = bridge.await.expect("MCP process launched") {
+            let disconnected = error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                )
+            });
+            assert!(disconnected, "unexpected MCP startup failure: {error}");
+        }
+        mcp_ping(mcp_command())
+            .await
+            .expect("MCP reconnects after upgrade");
+    }
+    assert_ne!(fixture.instance_token(), instance);
+    assert!(original.is_file(), "the old package remains available");
+    assert!(fixture.installed().starts_with(fixture.version_dir("cuda")));
+    assert!(!fixture.install.join("activation.json").exists());
+}
