@@ -1039,7 +1039,8 @@ async fn one_upgrade_serializes_installers_and_allows_concurrent_cli_and_mcp_cli
         .kill_on_drop(true)
         .spawn()
         .expect("upgrade");
-    tokio::time::timeout(Duration::from_secs(30), async {
+    // Copying and hashing a debug package can exceed 30 seconds on shared CI runners.
+    tokio::time::timeout(Duration::from_secs(120), async {
         while !fixture.version_dir("cuda").exists() {
             assert!(
                 upgrade.try_wait().expect("upgrade status").is_none(),
